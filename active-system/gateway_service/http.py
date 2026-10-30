@@ -29,11 +29,13 @@ async def offload(function,*args,**kwargs):
         finally:raise
 
 class FileGateway:
-    def __init__(self, store, issuer_policy, *, base_path='', quotas=None, pacer=None, seconds_per_use=120, idle_seconds=5):
+    def __init__(self, store, issuer_policy, *, base_path='', quotas=None, pacer=None, seconds_per_use=120, idle_seconds=5, max_requests_per_minute=256):
         self.store=store;self.gate=Gatekeeper(store,issuer_policy,base_path=base_path,clock=store.clock)
         self.host=urlsplit(self.gate.origin).netloc;self.quotas=quotas or Quotas(store);self.pacer=pacer or Pacer()
         if type(seconds_per_use) is not int or not 1<=seconds_per_use<=120 or not 0<idle_seconds<=10:
             raise ValueError('Bounded transfer lifetime and idle timeout required')
+        if type(max_requests_per_minute) is not int or not 1<=max_requests_per_minute<=100000:raise ValueError('Bounded request limit required')
+        self.max_requests_per_minute=max_requests_per_minute
         self.seconds=seconds_per_use;self.idle=idle_seconds;self.active=0
         self.window=0;self.requests=0
         self.client_source=Path(__file__).with_name('client.mjs').read_bytes()
@@ -58,7 +60,7 @@ class FileGateway:
         now=int(time.monotonic())//60
         if now!=self.window:self.window=now;self.requests=0
         self.requests+=1
-        if self.requests>256 or self.active>=4:raise web.HTTPTooManyRequests(text='Gateway request capacity reached')
+        if self.requests>self.max_requests_per_minute or self.active>=4:raise web.HTTPTooManyRequests(text='Gateway request capacity reached')
 
     async def _read(self, request, *, principal=None, deadline):
         chunks=[];total=0
