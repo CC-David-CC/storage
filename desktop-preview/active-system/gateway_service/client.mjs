@@ -1,0 +1,95 @@
+/** Account files over same-origin HTTPS. Never sends credentials to another URL. */
+import {hash,signJws,inspectJws,verifyJws,sameKey,validateTimes,nowSeconds,requireThat} from '../network/crypto.mjs';
+import {verifyIdentity,PROOF_TYPE} from '../network/identity.mjs';
+
+const MAX_FILE=8*1024*1024,MAX_RESPONSE=12*1024*1024;
+export class FileRequestError extends Error{
+  constructor(message,status){super(message);this.name='FileRequestError';this.status=status;}
+}
+function encode(bytes){
+  let chunks=[];
+  for(let offset=0;offset<bytes.length;offset+=8192)chunks.push(String.fromCharCode(...bytes.subarray(offset,offset+8192)));
+  return btoa(chunks.join(''));
+}
+function decode(text){
+  requireThat(typeof text==='string'&&text.length<=Math.ceil(MAX_FILE/3)*4,'Invalid file response');
+  const raw=atob(text);requireThat(raw.length<=MAX_FILE,'File response too large');
+  const bytes=Uint8Array.from(raw,c=>c.charCodeAt(0));requireThat(encode(bytes)===text,'Noncanonical file response');return bytes;
+}
+export class UserFiles{
+  constructor(config,session,{sessionValid=()=>true}={}){
+    const api=config?.identity?.apiBase,base=config?.gateway?.basePath;
+    requireThat(config?.identity?.mode==='server'&&config.identity.issuer===location.origin,'Same-origin issuer required');
+    requireThat(typeof api==='string'&&/^\/(?:[A-Za-z0-9_-]+\/)*api\/v1$/.test(api),'Canonical issuer API required');
+    requireThat(config.gateway.version==='codi-user-files/1'&&base===api.slice(0,-7)+'/gateway','Same-origin file gateway required');
+    this.config=config;this.session=session;this.valid=sessionValid;this.base=base;this.api=api;
+  }
+  check(){requireThat(this.valid()&&this.session.public.kind==='registered','Sign in to access your server files');}
+  async post(path,body,{token=null,headers={},timeout=15000}={}){
+    this.check();
+    const response=await fetch(path,{method:'POST',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:'no-referrer',
+      headers:{'Content-Type':'application/json',...(token?{Authorization:'Codi '+token}:{}),...headers},body,signal:AbortSignal.timeout(timeout)});
+    const reader=response.body.getReader(),chunks=[];let size=0;
+    try{
+      while(true){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>MAX_RESPONSE)throw Error('File response too large');chunks.push(value);}
+    }catch(error){await reader.cancel().catch(()=>{});throw error;}
+    const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length;}
+    let value;try{value=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));}catch{throw Error('Invalid file service response');}
+    this.check();if(!response.ok)throw new FileRequestError(value.error||'File request failed',response.status);return value;
+  }
+  async request(operation,fields={}){
+    this.check();const session=this.session,sid=session.public.sid,publicKey=session.public.key,key=session.privateKey;
+    await verifyIdentity(session.public,this.config.identity);this.check();
+    const raw=JSON.stringify({resource:'my-files',operation,...fields});requireThat(new TextEncoder().encode(raw).length<=MAX_RESPONSE,'File request too large');
+    const requestSha=await hash(raw);
+    const challenge=await this.post(this.base+'/challenge',JSON.stringify({key:publicKey,request_sha256:requestSha}));
+    requireThat(typeof challenge.nonce==='string'&&/^[A-Za-z0-9_-]{43}$/.test(challenge.nonce)&&challenge.request_sha256===requestSha,'Invalid gateway challenge');
+    const authorize=this.api+'/gateway/authorize';
+    const issuerNonce=await this.post(this.api+'/gateway/challenge',JSON.stringify({key:publicKey,path:authorize}));
+    const signedRequest=JSON.stringify({nonce:challenge.nonce,request_sha256:requestSha}),now=nowSeconds();
+    const issuerProof=await signJws({v:1,nonce:issuerNonce.nonce,iss:sid,aud:this.config.identity.issuer,method:'POST',path:authorize,iat:now,exp:now+60,request_sha256:await hash(signedRequest)},key,PROOF_TYPE);
+    const result=await this.post(authorize,JSON.stringify({request:signedRequest,proof:issuerProof}),{token:session.token});
+    const inspected=inspectJws(result.confirmation,'codi-gateway-identity+jwt',8192);
+    const authority=this.config.identity.authorityKeys.find(k=>k.kid===inspected.header.kid);requireThat(authority,'Unknown file authorization authority');
+    const c=await verifyJws(result.confirmation,authority.jwk,'codi-gateway-identity+jwt',8192);validateTimes(c,30);
+    const audience=location.origin+this.base;
+    requireThat(c.v===1&&c.iss===this.config.identity.issuer&&c.aud===audience&&c.sid===sid&&c.sub===session.public.sub&&c.kind==='registered'&&sameKey(c.cnf?.jwk,publicKey)&&c.nonce===challenge.nonce&&c.request_sha256===requestSha,'File authorization context changed');
+    this.check();requireThat(session.public.sid===sid,'File session changed');
+    // The verified issuer time also works when the device clock is slightly
+    // ahead; the proof still cannot outlive this exact short-lived grant.
+    const proof=await signJws({v:1,iss:sid,aud:audience,nonce:challenge.nonce,grant_sha256:await hash(result.confirmation),request_sha256:requestSha,method:'POST',path:this.base+'/use',iat:c.iat,exp:c.exp},key,'codi-gateway-use+jws');
+    return this.post(this.base+'/use',raw,{headers:{Authorization:'Codi-File '+result.confirmation+' '+proof},timeout:125000});
+  }
+  wordCount(path,previousSHA256){return this.request('word-count',{path,previousSHA256});}
+  list(path=''){return this.request('list',{path});}
+  mkdir(path){return this.request('mkdir',{path});}
+  async supportsVersion(){
+    this.check();
+    const response=await fetch(this.base+'/capabilities',{method:'GET',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:'no-referrer',signal:AbortSignal.timeout(10000)});
+    this.check();if(response.status===404)return false;
+    if(!response.ok)throw new FileRequestError('File capabilities unavailable',response.status);
+    const reader=response.body.getReader(),chunks=[];let length=0;
+    try{while(true){const {done,value}=await reader.read();if(done)break;length+=value.length;if(length>1024)throw Error('File capabilities response too large');chunks.push(value);}}
+    catch(error){await reader.cancel().catch(()=>{});throw error;}
+    const raw=new Uint8Array(length);let offset=0;for(const chunk of chunks){raw.set(chunk,offset);offset+=chunk.length;}
+    let result;try{result=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(raw));}catch{throw Error('Invalid file capabilities');}
+    this.check();return !!(result&&Object.keys(result).length===2&&result.version==='codi-file-capabilities/1'&&result.fileVersion===true);
+  }
+  async version(path){
+    const result=await this.request('version',{path});
+    requireThat(result&&Object.keys(result).length===2&&Number.isSafeInteger(result.bytes)&&result.bytes>=0&&result.bytes<=MAX_FILE&&typeof result.sha256==='string'&&/^[0-9a-f]{64}$/.test(result.sha256),'Invalid file version response');
+    return {bytes:result.bytes,sha256:result.sha256};
+  }
+  async read(path){
+    const result=await this.request('read',{path}),data=decode(result.data);
+    const actual=[...new Uint8Array(await crypto.subtle.digest('SHA-256',data))].map(b=>b.toString(16).padStart(2,'0')).join('');
+    requireThat(result.bytes===data.length&&result.sha256===actual,'File integrity check failed');return {data,sha256:actual};
+  }
+  write(path,data,previousSHA256=null){
+    if(typeof data==='string')data=new TextEncoder().encode(data);
+    requireThat(data instanceof Uint8Array&&data.length<=MAX_FILE,'Files are limited to 8 MiB');
+    return this.request(previousSHA256===null?'create':'replace',{path,data:encode(data),...(previousSHA256===null?{}:{previousSHA256})});
+  }
+  remove(path,previousSHA256=null){return this.request('delete',{path,previousSHA256});}
+  rename(path,destination,previousSHA256){return this.request('rename',{path,destination,previousSHA256});}
+}
