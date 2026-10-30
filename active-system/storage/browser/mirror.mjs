@@ -1,0 +1,109 @@
+/** Account-scoped local-first file mirror. The server client performs signed,
+ * authorized operations; this module never sends a file to another origin. */
+const MAX_FILE=8*1024*1024, MAX_ENTRIES=4096;
+const need=(value,message)=>{if(!value)throw Error(message);};
+export function filePath(value){
+  need(typeof value==='string'&&new TextEncoder().encode(value).length<=2048&&value.startsWith('/'),'Use an absolute file path.');
+  if(value==='/')return value;
+  const parts=value.slice(1).split('/');
+  need(parts.length<=16&&parts.every(p=>p&&p!=='.'&&p!=='..'&&!p.startsWith('.')&&new TextEncoder().encode(p).length<=255&&!/[\\%?#\x00-\x1f\x7f]/.test(p)),'Invalid file path.');
+  return '/'+parts.join('/');
+}
+export function fileName(value){const name=String(value).trim();need(name&&!name.includes('/')&&filePath('/'+name)==='/'+name,'Enter a valid file name.');return name;}
+const parent=path=>path.slice(0,path.lastIndexOf('/'))||'/';
+const name=path=>path.slice(path.lastIndexOf('/')+1);
+const bytes=value=>typeof value==='string'?new TextEncoder().encode(value):value instanceof Uint8Array?Uint8Array.from(value):value instanceof ArrayBuffer?new Uint8Array(value.slice(0)):null;
+async function digest(value){return [...new Uint8Array(await crypto.subtle.digest('SHA-256',value))].map(b=>b.toString(16).padStart(2,'0')).join('');}
+export class MirrorConflict extends Error{constructor(message='This file changed on another device. Choose which copy to keep.'){super(message);this.name='MirrorConflict';}}
+export class MirroredFiles{
+  #scope;#server;#valid;#db;#opening;#running;#closed=false;#listeners=new Set();#timer;#online;#again=false;#lastError=null;#lastSynced=null;
+  constructor({scope,server,valid=()=>true,onChange=()=>{},retryMs=15000}={}){
+    need(typeof scope==='string'&&scope.length>0&&scope.length<=512&&server&&typeof valid==='function'&&typeof onChange==='function','Authenticated file mirror required.');
+    this.#scope=scope;this.#server=server;this.#valid=valid;this.#listeners.add(onChange);
+    this.#online=()=>this.sync().catch(()=>{});globalThis.addEventListener?.('online',this.#online);
+    if(retryMs>0)this.#timer=setInterval(()=>{if(globalThis.navigator?.onLine!==false)this.sync().catch(()=>{});},retryMs);
+  }
+  #check(){need(!this.#closed&&this.#valid(),'Account changed. Reopen your files.');}
+  #changed(){for(const fn of this.#listeners)try{fn();}catch(e){console.error('File view update failed',e);}}
+  subscribe(fn){this.#check();need(typeof fn==='function','Listener required.');this.#listeners.add(fn);return ()=>this.#listeners.delete(fn);}
+  async #open(){
+    this.#check();if(this.#db)return this.#db;
+    this.#opening??=new Promise((resolve,reject)=>{const request=indexedDB.open('codi-mirrored-files-v1',1);
+      request.onupgradeneeded=()=>{const store=request.result.createObjectStore('files',{keyPath:['scope','path']});store.createIndex('scope','scope');};
+      request.onerror=()=>reject(request.error);request.onblocked=()=>reject(Error('Browser file storage is blocked.'));request.onsuccess=()=>resolve(request.result);
+    }).then(db=>{if(this.#closed||!this.#valid()){db.close();throw Error('Account changed. Reopen your files.');}db.onversionchange=()=>{db.close();this.#db=null;};return this.#db=db;}).finally(()=>{this.#opening=null;});
+    return this.#opening;
+  }
+  async #tx(mode,action){
+    const db=await this.#open();this.#check();return new Promise((resolve,reject)=>{const tx=db.transaction('files',mode),store=tx.objectStore('files');let result,problem;
+      const fail=e=>{problem=e;try{tx.abort();}catch{}};
+      tx.oncomplete=()=>{try{this.#check();resolve(result);}catch(e){reject(e);}};tx.onabort=tx.onerror=()=>reject(problem||tx.error||Error('Browser file storage failed.'));
+      try{action(store,value=>{result=value;},fail);}catch(e){fail(e);}
+    });
+  }
+  async #all(){return this.#tx('readonly',(store,done,fail)=>{const request=store.index('scope').getAll(this.#scope);request.onsuccess=()=>done(request.result);request.onerror=()=>fail(request.error);});}
+  async #get(path){return this.#tx('readonly',(store,done,fail)=>{const request=store.get([this.#scope,path]);request.onsuccess=()=>done(request.result||null);request.onerror=()=>fail(request.error);});}
+  async #update(path,fn){return this.#tx('readwrite',(store,done,fail)=>{const request=store.get([this.#scope,path]);request.onsuccess=()=>{try{this.#check();const [next,result]=fn(request.result||null);if(next===null)store.delete([this.#scope,path]);else if(next!==undefined)store.put(next);done(result);}catch(e){fail(e);}};request.onerror=()=>fail(request.error);});}
+  // Validate hierarchy and write within one IndexedDB transaction across tabs.
+  async #mutate(path,fn){return this.#tx('readwrite',(store,done,fail)=>{const request=store.index('scope').getAll(this.#scope);request.onsuccess=()=>{try{this.#check();const all=request.result,old=all.find(r=>r.path===path)||null;const [next,result]=fn(old,all);if(next===null)store.delete([this.#scope,path]);else if(next!==undefined)store.put(next);done(result);}catch(e){fail(e);}};request.onerror=()=>fail(request.error);});}
+  async list(path='/'){
+    path=filePath(path);const all=await this.#all();if(path!=='/'){const dir=all.find(r=>r.path===path&&!r.deleted);need(dir?.directory,'Folder not found.');}
+    return {entries:all.filter(r=>(!r.deleted||r.conflict)&&parent(r.path)===path).sort((a,b)=>a.path.localeCompare(b.path)).map(r=>({path:r.path,name:name(r.path),directory:r.directory,bytes:r.directory?null:r.data.byteLength,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'}))};
+  }
+  async status(){const all=await this.#all();return {pending:all.filter(r=>r.dirty&&!r.conflict).length,conflicts:all.filter(r=>r.conflict).length,error:this.#lastError,lastSynced:this.#lastSynced};}
+  async read(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');return {data:new Uint8Array(r.data.slice(0)),sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
+  async write(path,data,expected=null){
+    path=filePath(path);need(path!=='/','Enter a filename.');const copy=bytes(data);need(copy&&copy.length<=MAX_FILE,'Files are limited to 8 MiB.');const sha256=await digest(copy);this.#check();
+    const result=await this.#mutate(path,(old,all)=>{if(parent(path)!=='/'){const p=all.find(r=>r.path===parent(path));need(p&&!p.deleted&&p.directory,'Create the parent folder first.');}need(all.length<MAX_ENTRIES||old,'Browser file limit reached.');if(expected===null?!!old:!old||old.deleted||old.directory||old.version!==expected)throw new MirrorConflict('This file changed; reload it before saving.');
+      const row={scope:this.#scope,path,directory:false,data:copy.buffer,sha256,base:old?.base??null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:!!old?.conflict};return [row,{path,version:row.version,sha256,status:row.conflict?'conflict':'pending'}];});
+    this.#changed();this.sync().catch(()=>{});return result;
+  }
+  async mkdir(path){path=filePath(path);need(path!=='/','Root already exists.');const result=await this.#mutate(path,(old,all)=>{if(parent(path)!=='/'){const p=all.find(r=>r.path===parent(path));need(p&&!p.deleted&&p.directory,'Create the parent folder first.');}need(all.length<MAX_ENTRIES,'Browser file limit reached.');if(old)throw new MirrorConflict('An item with that name already exists.');const row={scope:this.#scope,path,directory:true,data:null,sha256:null,base:null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:false};return [row,{path,version:row.version,status:'pending'}];});this.#changed();this.sync().catch(()=>{});return result;}
+  async remove(path,expected){path=filePath(path);need(path!=='/'&&typeof expected==='string','A saved version is required.');await this.#mutate(path,(old,all)=>{need(!all.some(r=>!r.deleted&&parent(r.path)===path),'Folder must be empty before deleting.');if(!old||old.deleted||old.version!==expected)throw new MirrorConflict('This item changed; reload before deleting.');return [{...old,version:crypto.randomUUID(),dirty:true,deleted:true,conflict:!!old.conflict},true];});this.#changed();this.sync().catch(()=>{});}
+  async #remoteInventory(){
+    const inventory=new Map(),queue=['/'];while(queue.length){this.#check();const dir=queue.shift(),result=await this.#server.list(dir==='/'?'':dir.slice(1));this.#check();need(Array.isArray(result.entries),'Invalid server folder listing.');
+      for(const item of result.entries){need(item&&typeof item.name==='string'&&typeof item.directory==='boolean','Invalid server file listing.');const path=filePath((dir==='/'?'':dir)+'/'+item.name);need(!inventory.has(path)&&inventory.size<MAX_ENTRIES,'Server file list exceeds the browser limit.');inventory.set(path,{directory:item.directory});if(item.directory)queue.push(path);}
+    }return inventory;
+  }
+  async #ack(row,base,{remove=false}={}){await this.#update(row.path,current=>{if(!current)return [undefined,false];if(current.version===row.version)return [remove?null:{...current,base,dirty:false,conflict:false},true];if(current.base===row.base)return [{...current,base},false];return [undefined,false];});}
+  async #conflict(row){await this.#update(row.path,current=>current?.version===row.version?[{...current,conflict:true},true]:[undefined,false]);}
+  async #install(row,remote){await this.#update(row.path,current=>{if(row.version===null?!!current:!current||current.version!==row.version||current.dirty)return [undefined,false];return [{scope:this.#scope,path:row.path,directory:remote.directory,data:remote.data??null,sha256:remote.sha256??null,base:remote.directory?'dir':remote.sha256,version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false},true];});}
+  async #pass(){
+    this.#check();const remote=await this.#remoteInventory(),rows=await this.#all();this.#check();
+    // Create parents before children; remove children before parents.
+    const dirty=rows.filter(r=>r.dirty&&!r.conflict).sort((a,b)=>(a.deleted?1:0)-(b.deleted?1:0)||(a.deleted?b.path.length-a.path.length:a.path.length-b.path.length));
+    for(const row of dirty){this.#check();const existing=remote.get(row.path),target=row.path.slice(1);
+      if(row.directory){
+        if(row.deleted){if(existing){if(!existing.directory||[...remote.keys()].some(p=>parent(p)===row.path)){await this.#conflict(row);continue;}await this.#server.remove(target,null);remote.delete(row.path);}await this.#ack(row,null,{remove:true});}
+        else if(existing&&!existing.directory)await this.#conflict(row);
+        else{if(!existing){await this.#server.mkdir(target);remote.set(row.path,{directory:true});}await this.#ack(row,'dir');}
+      }else{
+        if(existing?.directory){await this.#conflict(row);continue;}
+        const current=existing?await this.#server.read(target):null;this.#check();
+        if(row.deleted){if(!current){await this.#ack(row,null,{remove:true});continue;}if(current.sha256!==row.base){await this.#conflict(row);continue;}await this.#server.remove(target,row.base);remote.delete(row.path);await this.#ack(row,null,{remove:true});}
+        else if(current?.sha256===row.sha256)await this.#ack(row,row.sha256);
+        else if((current?.sha256??null)!==row.base)await this.#conflict(row);
+        else{await this.#server.write(target,new Uint8Array(row.data),row.base);remote.set(row.path,{directory:false});await this.#ack(row,row.sha256);}
+      }
+    }
+    // Re-read current local rows: an edit can arrive while the server is slow.
+    const fresh=await this.#all(),local=new Map(fresh.map(r=>[r.path,r]));
+    for(const [path,item] of remote){this.#check();const row=local.get(path);if(row?.dirty)continue;
+      if(item.directory){if(!row)await this.#install({path,version:null},{directory:true});else if(!row.directory)await this.#conflict({...row,dirty:true});continue;}
+      if(row?.directory){await this.#conflict({...row,dirty:true});continue;}
+      const value=await this.#server.read(path.slice(1));this.#check();if(!row||row.sha256!==value.sha256)await this.#install({path,version:row?.version??null},{directory:false,data:value.data.buffer.slice(value.data.byteOffset,value.data.byteOffset+value.data.byteLength),sha256:value.sha256});
+    }
+    for(const row of fresh){if(row.dirty||remote.has(row.path))continue;if(row.directory&&fresh.some(child=>child.dirty&&child.path.startsWith(row.path+'/')))continue;await this.#update(row.path,current=>current&&!current.dirty&&current.version===row.version?[null,true]:[undefined,false]);}
+    this.#changed();return {pending:(await this.#all()).filter(r=>r.dirty).length};
+  }
+  sync(){this.#check();if(this.#running){this.#again=true;return this.#running;}const run=async()=>{let result;do{this.#again=false;result=await this.#pass();}while(this.#again&&!this.#closed&&this.#valid());return result;};const task=(globalThis.navigator?.locks?.request?navigator.locks.request('codi-mirror:'+this.#scope,{mode:'exclusive'},run):run()).then(result=>{this.#lastError=null;this.#lastSynced=Date.now();this.#changed();return result;},error=>{if(!this.#closed){this.#lastError=error.message||'Server sync unavailable.';this.#changed();}throw error;}).finally(()=>{if(this.#running===task)this.#running=null;});this.#running=task;return task;}
+  async resolve(path,choice,expected){path=filePath(path);need(['local','server'].includes(choice),'Choose which copy to keep.');const row=await this.#get(path);if(!row||!row.conflict||row.version!==expected)throw new MirrorConflict('This item changed; reload before resolving.');need(!row.directory,'Folder conflicts require manual resolution.');
+    const inventory=await this.#remoteInventory(),entry=inventory.get(path);need(!entry?.directory,'The server has a folder at this path.');const remote=entry?await this.#server.read(path.slice(1)):null;this.#check();
+    if(choice==='local'){await this.#update(path,current=>{if(!current||current.version!==expected)throw new MirrorConflict();return [{...current,base:remote?.sha256??null,conflict:false,dirty:true},true];});}
+    else{await this.#update(path,current=>{if(!current||current.version!==expected)throw new MirrorConflict();if(!remote)return [null,true];return [{scope:this.#scope,path,directory:false,data:remote.data.buffer.slice(remote.data.byteOffset,remote.data.byteOffset+remote.data.byteLength),sha256:remote.sha256,base:remote.sha256,version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false},true];});}
+    this.#changed();if(choice==='local')this.sync().catch(()=>{});
+  }
+  async persistence(){return {supported:typeof navigator.storage?.persist==='function'&&typeof navigator.storage?.persisted==='function',persistent:typeof navigator.storage?.persisted==='function'&&await navigator.storage.persisted()===true};}
+  async requestPersistence(){need(navigator.userActivation?.isActive,'Use the storage protection button.');need(typeof navigator.storage?.persist==='function','Storage protection is unavailable.');await navigator.storage.persist();return this.persistence();}
+  close(){if(this.#closed)return;this.#closed=true;clearInterval(this.#timer);globalThis.removeEventListener?.('online',this.#online);this.#listeners.clear();this.#db?.close();this.#db=null;}
+}
