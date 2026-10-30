@@ -266,6 +266,33 @@ class UserStore:
                     if descriptor is not None:
                         os.close(descriptor)
 
+    def open_read_snapshot(self,principal,path,*,maximum_bytes):
+        """Open one private file and hash it in chunks; caller owns the returned fd.
+
+        Normal API writes publish with atomic rename, so an open descriptor
+        continues to refer to the selected version even if its path is replaced.
+        The client checks the digest if a local operator changes bytes in place.
+        """
+        maximum=integer(maximum_bytes,1,self.per_user_bytes)
+        with self.lock(),self.db() as db:
+            home=self._authorized(db,principal,'read');parent=fd=None
+            try:
+                parent,name=self._parent(home,path)
+                fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,dir_fd=parent)
+                info=self._data_stat(fd)
+                if info.st_size>maximum:raise Denied('File size limit exceeded')
+                digest=hashlib.sha256();size=0
+                while chunk:=os.read(fd,65536):
+                    size+=len(chunk)
+                    if size>maximum:raise Denied('File size limit exceeded')
+                    digest.update(chunk)
+                if size!=info.st_size:raise Conflict('File changed while reading')
+                os.lseek(fd,0,os.SEEK_SET)
+                result=(fd,size,digest.hexdigest());fd=None;return result
+            finally:
+                for descriptor in [fd,parent,home]:
+                    if descriptor is not None:os.close(descriptor)
+
     def list(self, principal, path=''):
         with self.lock(), self.db() as db:
             fd = self._authorized(db, principal, 'list')
@@ -375,6 +402,58 @@ class UserStore:
                 for descriptor in [old, fd, parent, home]:
                     if descriptor is not None:
                         os.close(descriptor)
+
+    def put_stream(self, principal, path, stream, size, sha256, *, previous_sha256=None, phase=lambda name: None):
+        """Publish a verified, bounded temporary upload without loading it into RAM.
+
+        `stream` is a server-owned binary file object, not a pathname from a
+        client. Both size and content hash are rechecked while copying into the
+        account's private staging file, before atomic publication.
+        """
+        integer(size,0,self.per_user_bytes)
+        if not isinstance(sha256,str) or not re.fullmatch('[0-9a-f]{64}',sha256) or not callable(getattr(stream,'read',None)):
+            raise Denied('Bounded upload and SHA-256 required')
+        operation='replace' if previous_sha256 is not None else 'create'
+        if previous_sha256 is not None and (not isinstance(previous_sha256,str) or not re.fullmatch('[0-9a-f]{64}',previous_sha256)):
+            raise Denied('Exact previous content hash required')
+        home_id=registered(principal)
+        with self.lock(),self.db() as db:
+            home=self._authorized(db,principal,operation)
+            parent=fd=old=None;temporary=None
+            try:
+                parent,name=self._parent(home,path);existing_size=0;exists=False
+                try:old=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,dir_fd=parent);exists=True
+                except FileNotFoundError:pass
+                if operation=='create' and exists or operation=='replace' and not exists:raise Conflict('Save precondition failed')
+                if old is not None:
+                    info=self._data_stat(old);existing_size=info.st_size
+                    if existing_size>self.per_user_bytes:raise Denied('File size limit exceeded')
+                    digest=hashlib.sha256();seen=0
+                    while chunk:=os.read(old,65536):
+                        seen+=len(chunk)
+                        if seen>self.per_user_bytes:raise Denied('File size limit exceeded')
+                        digest.update(chunk)
+                    if seen!=existing_size or digest.hexdigest()!=previous_sha256:raise Conflict('File changed; reload before replacing it')
+                usage,total,entries=self._usage(clean_staging=True);used,count=usage[home_id]
+                if used-existing_size+size>self.per_user_bytes or total-existing_size+size>self.total_bytes or count+(not exists)>self.per_user_entries or entries+(not exists)>self.total_entries:
+                    raise Denied('Storage quota exceeded')
+                temporary='.save-'+secrets.token_hex(16)
+                fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600,dir_fd=parent)
+                digest=hashlib.sha256();seen=0
+                with os.fdopen(fd,'wb',closefd=False) as target:
+                    while seen<size:
+                        chunk=stream.read(min(65536,size-seen))
+                        if not isinstance(chunk,bytes) or not chunk or len(chunk)>size-seen:raise Denied('Truncated or invalid upload')
+                        target.write(chunk);digest.update(chunk);seen+=len(chunk)
+                    if stream.read(1) or digest.hexdigest()!=sha256:raise Denied('Upload size or hash changed')
+                    target.flush();os.fsync(fd)
+                phase('staged');self._publish(parent,temporary,name,replace=operation=='replace')
+                temporary=None;os.fsync(parent);phase('committed')
+                return {'bytes':size,'sha256':sha256}
+            finally:
+                if temporary is not None:os.unlink(temporary,dir_fd=parent)
+                for descriptor in [old,fd,parent,home]:
+                    if descriptor is not None:os.close(descriptor)
 
     def mkdir(self, principal, path):
         with self.lock(), self.db() as db:

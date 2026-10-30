@@ -50,7 +50,7 @@ export class UserFiles{
     let value;try{value=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));}catch{throw Error('Invalid file service response');}
     this.check();if(!response.ok)throw new FileRequestError(value.error||'File request failed',response.status);return value;
   }
-  async request(operation,fields={}){
+  async request(operation,fields={},binary=null){
     this.check();const session=this.session,sid=session.public.sid,publicKey=session.public.key,key=session.privateKey;
     await verifyIdentity(session.public,this.config.identity);this.check();
     const raw=JSON.stringify({resource:'my-files',operation,...fields});requireThat(new TextEncoder().encode(raw).length<=MAX_RESPONSE,'File request too large');
@@ -71,7 +71,15 @@ export class UserFiles{
     // The verified issuer time also works when the device clock is slightly
     // ahead; the proof still cannot outlive this exact short-lived grant.
     const proof=await signJws({v:1,iss:sid,aud:audience,nonce:challenge.nonce,grant_sha256:await hash(result.confirmation),request_sha256:requestSha,method:'POST',path:this.base+'/use',iat:c.iat,exp:c.exp},key,'codi-gateway-use+jws');
-    return this.post(this.base+'/use',raw,{headers:{Authorization:'Codi-File '+result.confirmation+' '+proof},timeout:910000});
+    const authorization='Codi-File '+result.confirmation+' '+proof;
+    if(binary!==null){
+      requireThat(binary instanceof Uint8Array&&binary.length<=MAX_FILE,'Invalid binary upload');
+      const metadata=new TextEncoder().encode(raw);requireThat(metadata.length<=8192,'Upload metadata too large');
+      const prefix=new Uint8Array(4);new DataView(prefix.buffer).setUint32(0,metadata.length,false);
+      const body=new Blob([prefix,metadata,binary],{type:'application/octet-stream'});
+      return this.post(this.base+'/upload',body,{headers:{'Content-Type':'application/octet-stream',Authorization:authorization},timeout:910000});
+    }
+    return this.post(this.base+'/use',raw,{headers:{Authorization:authorization},timeout:910000});
   }
   wordCount(path,previousSHA256){return this.request('word-count',{path,previousSHA256});}
   list(path=''){return this.request('list',{path});}
@@ -98,10 +106,24 @@ export class UserFiles{
     const actual=[...new Uint8Array(await crypto.subtle.digest('SHA-256',data))].map(b=>b.toString(16).padStart(2,'0')).join('');
     requireThat(result.bytes===data.length&&result.sha256===actual,'File integrity check failed');return {data,sha256:actual};
   }
-  write(path,data,previousSHA256=null){
+  async supportsStreamingUpload(){
+    this.check();
+    const response=await fetch(this.base+'/upload-capabilities',{method:'GET',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:'no-referrer',signal:AbortSignal.timeout(10000)});
+    this.check();if(response.status===404)return false;
+    if(!response.ok)throw new FileRequestError('File upload capabilities unavailable',response.status);
+    const body=await response.text();requireThat(body.length<=1024,'Invalid upload capabilities');
+    let result;try{result=JSON.parse(body);}catch{throw Error('Invalid upload capabilities');}
+    return !!(result&&Object.keys(result).length===2&&result.version==='codi-binary-upload/1'&&result.maxBytes===MAX_FILE);
+  }
+  async write(path,data,previousSHA256=null){
     if(typeof data==='string')data=new TextEncoder().encode(data);
     requireThat(data instanceof Uint8Array&&data.length<=MAX_FILE,'Files are limited to 128 MiB');
-    return this.request(previousSHA256===null?'create':'replace',{path,data:encode(data),...(previousSHA256===null?{}:{previousSHA256})});
+    const operation=previousSHA256===null?'create':'replace';
+    if(await this.supportsStreamingUpload()){
+      const sha256=[...new Uint8Array(await crypto.subtle.digest('SHA-256',data))].map(b=>b.toString(16).padStart(2,'0')).join('');
+      return this.request(operation,{path,format:'codi-binary-upload/1',size:data.length,sha256,...(previousSHA256===null?{}:{previousSHA256})},data);
+    }
+    return this.request(operation,{path,data:encode(data),...(previousSHA256===null?{}:{previousSHA256})});
   }
   remove(path,previousSHA256=null){return this.request('delete',{path,previousSHA256});}
   rename(path,destination,previousSHA256){return this.request('rename',{path,destination,previousSHA256});}
