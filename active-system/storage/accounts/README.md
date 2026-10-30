@@ -9,7 +9,7 @@ its files are stored at:
 
 For example, the empty `data/` directory beside this note is a possible **local
 example**, and `state/` is a separate possible location for the permissions
-SQLite database. They are not configured or serving files automatically. Both
+SQLite database. They are not configured or serving files automatically; the local preview launcher explicitly uses them. Both
 are ignored by Git and must be private (owned by the file service and mode
 0700). The data and state roots must be separate. On a real server, configure
 private directories outside the source checkout and public web tree instead;
