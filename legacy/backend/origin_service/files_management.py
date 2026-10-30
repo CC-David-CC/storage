@@ -64,7 +64,7 @@ def ready(op,config):
     if not config.get('userFiles'):
         if public is not None:raise ValueError('Issuer still advertises disabled private files')
         return
-    expected={'version':'codi-user-files/1','basePath':config['basePath']+'/gateway','fileBytes':8*1024*1024}
+    expected={'version':'codi-user-files/1','basePath':config['basePath']+'/gateway','fileBytes':128*1024*1024}
     if public!=expected:raise ValueError('Issuer file metadata differs from managed policy')
     manager,backend=validate(op,config);manager.health(backend)
 def validate_pair(op,current,before,after):
