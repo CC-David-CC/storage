@@ -7,8 +7,10 @@ No private account/permission database, key or host path is ever a response.
 import asyncio
 import base64
 import hashlib
+import io
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 from aiohttp import web
@@ -17,7 +19,12 @@ from .policy import Denied, exact, parts
 from .transfers import Pacer, Quotas, AllowanceExceeded
 from .user_store import Conflict
 
-MAX_FILE_BYTES=8*1024*1024
+MAX_FILE_BYTES=128*1024*1024
+
+@dataclass(frozen=True)
+class ReadResponse:
+    data: bytes
+    sha256: str
 
 async def offload(function,*args,**kwargs):
     # Keep the admission slot until the actual disk/SQLite work finishes, even
@@ -29,10 +36,10 @@ async def offload(function,*args,**kwargs):
         finally:raise
 
 class FileGateway:
-    def __init__(self, store, issuer_policy, *, base_path='', quotas=None, pacer=None, seconds_per_use=120, idle_seconds=5, max_requests_per_minute=256):
+    def __init__(self, store, issuer_policy, *, base_path='', quotas=None, pacer=None, seconds_per_use=900, idle_seconds=5, max_requests_per_minute=256):
         self.store=store;self.gate=Gatekeeper(store,issuer_policy,base_path=base_path,clock=store.clock)
         self.host=urlsplit(self.gate.origin).netloc;self.quotas=quotas or Quotas(store);self.pacer=pacer or Pacer()
-        if type(seconds_per_use) is not int or not 1<=seconds_per_use<=120 or not 0<idle_seconds<=10:
+        if type(seconds_per_use) is not int or not 1<=seconds_per_use<=900 or not 0<idle_seconds<=10:
             raise ValueError('Bounded transfer lifetime and idle timeout required')
         if type(max_requests_per_minute) is not int or not 1<=max_requests_per_minute<=100000:raise ValueError('Bounded request limit required')
         self.max_requests_per_minute=max_requests_per_minute
@@ -63,14 +70,14 @@ class FileGateway:
         if self.requests>self.max_requests_per_minute or self.active>=4:raise web.HTTPTooManyRequests(text='Gateway request capacity reached')
 
     async def _read(self, request, *, principal=None, deadline):
-        chunks=[];total=0
+        chunks=io.BytesIO();total=0
         while total<request.content_length:
             async with asyncio.timeout(min(self.idle,max(.001,deadline-time.monotonic()))):
                 chunk=await request.content.read(min(self.pacer.burst if principal else 65536,request.content_length-total))
             if not chunk:raise Denied('Truncated gateway request')
             if principal:await self.pacer.wait(principal.sub,len(chunk),deadline)
-            chunks.append(chunk);total+=len(chunk)
-        return b''.join(chunks)
+            chunks.write(chunk);total+=len(chunk)
+        return chunks.getvalue()
 
     def _dispatch(self, principal, request):
         operation=request.get('operation')
@@ -90,12 +97,15 @@ class FileGateway:
         if operation in ('read','version'):
             result=self.store.read(principal,path,maximum_bytes=min(MAX_FILE_BYTES,self.store.per_user_bytes))
             if operation=='version':return {'bytes':len(result['bytes']),'sha256':result['sha256']}
-            return {'data':base64.b64encode(result['bytes']).decode('ascii'),'bytes':len(result['bytes']),'sha256':result['sha256']}
+            return ReadResponse(result['bytes'],result['sha256'])
         if operation in ('create','replace'):
             text=request['data']
             if not isinstance(text,str) or len(text)>((MAX_FILE_BYTES+2)//3)*4:raise Denied('File size limit exceeded')
             data=base64.b64decode(text,validate=True)
-            if len(data)>MAX_FILE_BYTES or base64.b64encode(data).decode('ascii')!=text:raise Denied('Canonical bounded file encoding required')
+            # validate=True checks the alphabet and padding placement. Recheck
+            # only the last quartet to reject noncanonical unused pad bits,
+            # avoiding another full-size base64 copy of a large upload.
+            if len(data)>MAX_FILE_BYTES or (text and base64.b64encode(data[-(len(data)%3 or 3):]).decode('ascii')!=text[-4:]):raise Denied('Canonical bounded file encoding required')
             return self.store.put(principal,path,data,previous_sha256=request.get('previousSHA256'))
         if operation=='mkdir':self.store.mkdir(principal,path)
         elif operation=='delete':self.store.delete(principal,path,previous_sha256=request['previousSHA256'])
@@ -140,7 +150,27 @@ class FileGateway:
             async with asyncio.timeout(max(.001,deadline-time.monotonic())):
                 raw=await self._read(request,principal=principal,deadline=deadline)
                 data=use.decode(raw)
+                del raw
                 result=await offload(self._dispatch,principal,data)
+                del data
+                if isinstance(result,ReadResponse):
+                    # Encode directly to the response in bounded blocks. The old
+                    # all-at-once encoding held multiple 170+ MiB copies of a
+                    # 128 MiB file and exceeded the live service memory cap.
+                    prefix=b'{"data":"'
+                    suffix=b'",'+jose.dumps({'bytes':len(result.data),'sha256':result.sha256})[1:].encode()
+                    length=len(prefix)+((len(result.data)+2)//3)*4+len(suffix)
+                    if length>MAX_REQUEST_BYTES:raise Denied('File response size limit exceeded')
+                    await offload(self.quotas.extend,transfer,max(0,length-512))
+                    response=web.StreamResponse(status=200,headers={'Content-Type':'application/json','Content-Length':str(length),'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'})
+                    await response.prepare(request)
+                    async def send(chunk):
+                        await self.pacer.wait(principal.sub,len(chunk),deadline);await response.write(chunk)
+                    await send(prefix)
+                    raw=result.data;block=(self.pacer.burst//4)*3
+                    for offset in range(0,len(raw),block):
+                        await send(base64.b64encode(raw[offset:offset+block]))
+                    await send(suffix);await response.write_eof();return response
                 output=jose.dumps(result).encode()
                 if len(output)>MAX_REQUEST_BYTES:raise Denied('File response size limit exceeded')
                 await offload(self.quotas.extend,transfer,max(0,len(output)-512))

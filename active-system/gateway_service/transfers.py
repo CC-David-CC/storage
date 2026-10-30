@@ -45,7 +45,7 @@ class Transfer:
 
 class Quotas:
     def __init__(self, store, *, daily_bytes=512*1024*1024, shared_daily_bytes=2*1024*1024*1024,
-                 bytes_per_use=32*1024*1024, concurrent_uses=2, shared_concurrent_uses=4):
+                 bytes_per_use=192*1024*1024, concurrent_uses=2, shared_concurrent_uses=4):
         self.store=store
         self.daily=integer(daily_bytes,1,1<<40);self.shared=integer(shared_daily_bytes,self.daily,1<<40)
         self.per_use=integer(bytes_per_use,1,1<<30);self.concurrent=integer(concurrent_uses,1,8)
@@ -89,7 +89,7 @@ class Quotas:
             db.execute('DELETE FROM gateway_active_uses WHERE id=? AND subject=?',(transfer.id,transfer.subject))
 
 class Pacer:
-    def __init__(self, *, per_second=1024*1024, shared_per_second=4*1024*1024, burst=65536,
+    def __init__(self, *, per_second=4*1024*1024, shared_per_second=8*1024*1024, burst=65536,
                  monotonic=time.monotonic, sleep=asyncio.sleep):
         self.per_second=integer(per_second,1,16*1024*1024)
         self.shared_per_second=integer(shared_per_second,1,64*1024*1024)

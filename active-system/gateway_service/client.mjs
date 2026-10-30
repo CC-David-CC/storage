@@ -2,19 +2,32 @@
 import {hash,signJws,inspectJws,verifyJws,sameKey,validateTimes,nowSeconds,requireThat} from '../network/crypto.mjs';
 import {verifyIdentity,PROOF_TYPE} from '../network/identity.mjs';
 
-const MAX_FILE=8*1024*1024,MAX_RESPONSE=12*1024*1024;
+const MAX_FILE=128*1024*1024,MAX_RESPONSE=192*1024*1024;
 export class FileRequestError extends Error{
   constructor(message,status){super(message);this.name='FileRequestError';this.status=status;}
 }
+// Keep temporary binary strings small; a 128 MiB file must not create a
+// second 128 MiB JavaScript string merely to call atob/btoa.
 function encode(bytes){
-  let chunks=[];
-  for(let offset=0;offset<bytes.length;offset+=8192)chunks.push(String.fromCharCode(...bytes.subarray(offset,offset+8192)));
-  return btoa(chunks.join(''));
+  const chunks=[],step=24*1024; // divisible by three, so only the last chunk has padding
+  for(let offset=0;offset<bytes.length;offset+=step){
+    const part=bytes.subarray(offset,offset+step);let binary='';
+    for(let i=0;i<part.length;i+=8192)binary+=String.fromCharCode(...part.subarray(i,i+8192));
+    chunks.push(btoa(binary));
+  }
+  return chunks.join('');
 }
 function decode(text){
-  requireThat(typeof text==='string'&&text.length<=Math.ceil(MAX_FILE/3)*4,'Invalid file response');
-  const raw=atob(text);requireThat(raw.length<=MAX_FILE,'File response too large');
-  const bytes=Uint8Array.from(raw,c=>c.charCodeAt(0));requireThat(encode(bytes)===text,'Noncanonical file response');return bytes;
+  requireThat(typeof text==='string'&&text.length<=Math.ceil(MAX_FILE/3)*4&&text.length%4===0,'Invalid file response');
+  const padding=text.endsWith('==')?2:text.endsWith('=')?1:0;
+  const size=text.length/4*3-padding;requireThat(size>=0&&size<=MAX_FILE,'File response too large');
+  const out=new Uint8Array(size),step=32*1024;let offset=0;
+  for(let start=0;start<text.length;start+=step){
+    const part=text.slice(start,start+step),raw=atob(part);
+    requireThat(btoa(raw)===part,'Noncanonical file response');
+    for(let i=0;i<raw.length;i++)out[offset++]=raw.charCodeAt(i);
+  }
+  requireThat(offset===size,'Invalid file response');return out;
 }
 export class UserFiles{
   constructor(config,session,{sessionValid=()=>true}={}){
@@ -58,7 +71,7 @@ export class UserFiles{
     // The verified issuer time also works when the device clock is slightly
     // ahead; the proof still cannot outlive this exact short-lived grant.
     const proof=await signJws({v:1,iss:sid,aud:audience,nonce:challenge.nonce,grant_sha256:await hash(result.confirmation),request_sha256:requestSha,method:'POST',path:this.base+'/use',iat:c.iat,exp:c.exp},key,'codi-gateway-use+jws');
-    return this.post(this.base+'/use',raw,{headers:{Authorization:'Codi-File '+result.confirmation+' '+proof},timeout:125000});
+    return this.post(this.base+'/use',raw,{headers:{Authorization:'Codi-File '+result.confirmation+' '+proof},timeout:910000});
   }
   wordCount(path,previousSHA256){return this.request('word-count',{path,previousSHA256});}
   list(path=''){return this.request('list',{path});}
@@ -87,7 +100,7 @@ export class UserFiles{
   }
   write(path,data,previousSHA256=null){
     if(typeof data==='string')data=new TextEncoder().encode(data);
-    requireThat(data instanceof Uint8Array&&data.length<=MAX_FILE,'Files are limited to 8 MiB');
+    requireThat(data instanceof Uint8Array&&data.length<=MAX_FILE,'Files are limited to 128 MiB');
     return this.request(previousSHA256===null?'create':'replace',{path,data:encode(data),...(previousSHA256===null?{}:{previousSHA256})});
   }
   remove(path,previousSHA256=null){return this.request('delete',{path,previousSHA256});}

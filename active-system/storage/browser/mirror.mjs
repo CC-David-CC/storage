@@ -1,6 +1,6 @@
 /** Account-scoped local-first file mirror. The server client performs signed,
  * authorized operations; this module never sends a file to another origin. */
-const MAX_FILE=8*1024*1024, MAX_ENTRIES=4096;
+const MAX_FILE=128*1024*1024, MAX_ENTRIES=4096;
 const need=(value,message)=>{if(!value)throw Error(message);};
 export function filePath(value){
   need(typeof value==='string'&&new TextEncoder().encode(value).length<=2048&&value.startsWith('/'),'Use an absolute file path.');
@@ -53,7 +53,7 @@ export class MirroredFiles{
   async status(){const all=await this.#all();return {pending:all.filter(r=>r.dirty&&!r.conflict).length,conflicts:all.filter(r=>r.conflict).length,error:this.#lastError,lastSynced:this.#lastSynced};}
   async read(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');return {data:new Uint8Array(r.data.slice(0)),sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
   async write(path,data,expected=null){
-    path=filePath(path);need(path!=='/','Enter a filename.');const copy=bytes(data);need(copy&&copy.length<=MAX_FILE,'Files are limited to 8 MiB.');const sha256=await digest(copy);this.#check();
+    path=filePath(path);need(path!=='/','Enter a filename.');const copy=bytes(data);need(copy&&copy.length<=MAX_FILE,'Files are limited to 128 MiB.');const sha256=await digest(copy);this.#check();
     const result=await this.#mutate(path,(old,all)=>{if(parent(path)!=='/'){const p=all.find(r=>r.path===parent(path));need(p&&!p.deleted&&p.directory,'Create the parent folder first.');}need(all.length<MAX_ENTRIES||old,'Browser file limit reached.');if(old?.moving)throw Error('Wait for this move to finish syncing.');if(expected===null?!!old:!old||old.deleted||old.directory||old.version!==expected)throw new MirrorConflict('This file changed; reload it before saving.');
       const row={scope:this.#scope,path,directory:false,data:copy.buffer,sha256,base:old?.base??null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:!!old?.conflict};return [row,{path,version:row.version,sha256,status:row.conflict?'conflict':'pending'}];});
     this.#changed();this.sync().catch(()=>{});return result;

@@ -5,6 +5,7 @@ before invoking a broker or UserStore. A browser-supplied account ID is never
 an authority. The issuer policy must come from protected operator configuration.
 """
 import re
+import hashlib
 from dataclasses import dataclass
 import secrets
 import sys
@@ -22,7 +23,7 @@ USE_TYPE = 'codi-gateway-use+jws'
 AUTHORIZE = '/api/v1/gateway/authorize'
 CHALLENGE = '/api/v1/gateway/challenge'
 LIFETIME = 30
-MAX_REQUEST_BYTES = 12 * 1024 * 1024
+MAX_REQUEST_BYTES = 192 * 1024 * 1024
 
 @dataclass(frozen=True)
 class AuthorizedUse:
@@ -32,10 +33,13 @@ class AuthorizedUse:
     def decode(self, raw):
         if not isinstance(raw, bytes) or len(raw) > MAX_REQUEST_BYTES:
             raise Denied('Bounded gateway request required')
-        text = raw.decode('utf-8')
-        if jose.digest(text) != self.request_sha256:
+        if jose.b64(hashlib.sha256(raw).digest()) != self.request_sha256:
             raise Denied('Authorized request bytes changed')
-        value = jose.loads(text)
+        # json.loads(bytes) also accepts UTF-16/32 and a UTF-8 BOM. This
+        # protocol accepts plain UTF-8 JSON only; literal NUL is never valid.
+        if b'\x00' in raw or raw.startswith(b'\xef\xbb\xbf'):
+            raise Denied('Plain UTF-8 JSON required')
+        value = jose.loads(raw)
         if not isinstance(value, dict):
             raise Denied('Object gateway request required')
         return value
@@ -155,14 +159,14 @@ class Gatekeeper:
             db.execute('DELETE FROM gateway_challenges WHERE nonce=?', (c['nonce'],));db.commit()
         return now
 
-    def begin(self, confirmation, proof, *, seconds=120):
+    def begin(self, confirmation, proof, *, seconds=900):
         """Authenticate before reading an upload, then bound its execution time.
 
         The 30s grant must be fresh at admission. An admitted exact request may
         finish within its operation deadline, never beyond its session deadline.
         Call decode() before any file operation to verify the transmitted body.
         """
-        if type(seconds) is not int or not 1 <= seconds <= 120:
+        if type(seconds) is not int or not 1 <= seconds <= 900:
             raise ValueError('Bounded gateway operation lifetime required')
         principal, c, p = self._verify(confirmation, proof)
         started = self._spend(principal, c, p)

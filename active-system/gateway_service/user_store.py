@@ -55,7 +55,7 @@ def private_directory(path):
 
 class UserStore:
     def __init__(self, state_root, data_root, *, clock=time.time,
-                 per_user_bytes=100*1024*1024, per_user_entries=1024,
+                 per_user_bytes=1024*1024*1024, per_user_entries=1024,
                  total_bytes=10*1024*1024*1024, total_entries=100000, maximum_users=1024):
         self.state_root = private_directory(state_root)
         self.data_root = private_directory(data_root)
