@@ -224,9 +224,25 @@ class UserStore:
             os.close(fd);raise
 
     @staticmethod
-    def _read(fd, maximum):
+    def _data_stat(fd):
+        """Validate an owned single-link data file and tighten common external modes."""
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > maximum:
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid():
+            raise Denied('Owned regular file required')
+        mode = stat.S_IMODE(info.st_mode)
+        # Only remove group/other access from owner-readable/writable files.
+        # Never broaden deliberately restrictive modes or follow a link.
+        if mode != 0o600 and mode & ~0o077 == 0o600:
+            os.fchmod(fd, 0o600)
+            info = os.fstat(fd)
+        if stat.S_IMODE(info.st_mode) != 0o600:
+            raise Denied('A private owner-readable/writable file is required')
+        return info
+
+    @staticmethod
+    def _read(fd, maximum):
+        info = UserStore._data_stat(fd)
+        if info.st_size > maximum:
             raise Denied('Regular file within the size limit required')
         chunks = [];size = 0
         while chunk := os.read(fd, min(65536, maximum + 1 - size)):
@@ -302,8 +318,10 @@ class UserStore:
                                 if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
                                     raise Denied('Private storage directory required')
                                 stack.append((os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd), depth + 1))
-                            elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o600:
-                                size += info.st_size
+                            elif stat.S_ISREG(info.st_mode):
+                                data_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fd)
+                                try:size += self._data_stat(data_fd).st_size
+                                finally:os.close(data_fd)
                             else:
                                 raise Denied('Unexpected link or special file in user storage')
                     finally:

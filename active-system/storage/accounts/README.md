@@ -33,3 +33,8 @@ It rejects unsafe path components and avoids following symlinks. The browser's
 Linux guest has no direct host filesystem access. This is application-enforced
 account isolation plus Linux isolation from other Unix users; it is not a
 separate kernel-enforced Unix UID per website account.
+
+Files created directly on disk must be owned by the file service. The service
+automatically tightens common owner-readable/writable file modes such as 0644
+and 0664 to 0600 when encountered. It does not broaden a restrictive mode,
+follow symlinks, or accept hard-linked files.
