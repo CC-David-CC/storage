@@ -14,6 +14,22 @@ class Server{
  async remove(path,previous=null){this.check();const old=this.files.get(path);if(!old)throw Object.assign(Error('missing'),{status:404});if(!old.directory&&await sha(old.data)!==previous)throw Object.assign(Error('conflict'),{status:409});if(old.directory&&[...this.files.keys()].some(x=>x.startsWith(path+'/')))throw Error('not empty');this.files.delete(path);}
 }
 const pause=()=>new Promise(r=>setTimeout(r,0));
+// Folder copies are local snapshots, including empty folders, that queue for
+// ordinary per-entry synchronization. Failed validation creates no partial tree.
+const treeServer=new Server(),treeMirror=new MirroredFiles({scope:'tree-copy',server:treeServer,retryMs:0});
+treeServer.offline=true;await treeMirror.mkdir('/Project');await treeMirror.mkdir('/Project/Empty');await treeMirror.mkdir('/Project/Nested');await treeMirror.write('/Project/Nested/code.txt','original');await pause();
+const treeVersion=(await treeMirror.list('/')).entries.find(x=>x.path==='/Project').version;
+await assert.rejects(()=>treeMirror.copyTree('/Project','/Project/Nested/copy',treeVersion),/outside/);
+await assert.rejects(()=>treeMirror.copyTree('/Project','/Project',treeVersion),/outside/);
+await assert.rejects(()=>treeMirror.copyTree('/Project','/Copy','stale'),/changed/);
+assert.deepEqual(await treeMirror.copyTree('/Project','/Copy',treeVersion),{path:'/Copy',entries:4});
+await assert.rejects(()=>treeMirror.copyTree('/Project','/Copy',treeVersion),/already exists/);
+assert.equal((await treeMirror.list('/Copy/Empty')).entries.length,0);
+const sourceCode=await treeMirror.read('/Project/Nested/code.txt');await treeMirror.write('/Project/Nested/code.txt','changed',sourceCode.version);
+assert.equal(new TextDecoder().decode((await treeMirror.read('/Copy/Nested/code.txt')).data),'original');
+const otherMirror=new MirroredFiles({scope:'tree-copy-other-user',server:new Server(),retryMs:0});assert.deepEqual((await otherMirror.list('/')).entries,[]);otherMirror.close();
+treeServer.offline=false;await treeMirror.sync();assert.equal(new TextDecoder().decode((await treeServer.read('Copy/Nested/code.txt')).data),'original');assert.ok(treeServer.files.has('Copy/Empty'));
+treeServer.offline=true;await treeMirror.copyTree('/Project','/RemoteRace',treeVersion);await pause();treeServer.files.set('RemoteRace',{directory:true});treeServer.files.set('RemoteRace/Nested',{directory:true});treeServer.files.set('RemoteRace/Nested/code.txt',{directory:false,data:new TextEncoder().encode('other device')});treeServer.offline=false;await treeMirror.sync();assert.equal((await treeMirror.read('/RemoteRace/Nested/code.txt')).status,'conflict');assert.equal(new TextDecoder().decode((await treeServer.read('RemoteRace/Nested/code.txt')).data),'other device');treeMirror.close();
 const server=new Server(),a=new MirroredFiles({scope:'issuer:user-a',server,retryMs:0}),b=new MirroredFiles({scope:'issuer:user-b',server:new Server(),retryMs:0});
 assert.throws(()=>filePath('/../escape'));assert.throws(()=>filePath('/.secret'));
 server.offline=true;const first=await a.write('/note.txt','offline');await pause();assert.equal((await a.read('/note.txt')).status,'pending');assert.deepEqual((await b.list('/')).entries,[]);
