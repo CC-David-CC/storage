@@ -30,6 +30,15 @@ assert.equal(new TextDecoder().decode((await treeMirror.read('/Copy/Nested/code.
 const otherMirror=new MirroredFiles({scope:'tree-copy-other-user',server:new Server(),retryMs:0});assert.deepEqual((await otherMirror.list('/')).entries,[]);otherMirror.close();
 treeServer.offline=false;await treeMirror.sync();assert.equal(new TextDecoder().decode((await treeServer.read('Copy/Nested/code.txt')).data),'original');assert.ok(treeServer.files.has('Copy/Empty'));
 treeServer.offline=true;await treeMirror.copyTree('/Project','/RemoteRace',treeVersion);await pause();treeServer.files.set('RemoteRace',{directory:true});treeServer.files.set('RemoteRace/Nested',{directory:true});treeServer.files.set('RemoteRace/Nested/code.txt',{directory:false,data:new TextEncoder().encode('other device')});treeServer.offline=false;await treeMirror.sync();assert.equal((await treeMirror.read('/RemoteRace/Nested/code.txt')).status,'conflict');assert.equal(new TextDecoder().decode((await treeServer.read('RemoteRace/Nested/code.txt')).data),'other device');treeMirror.close();
+// Archive imports commit the entire validated local tree, or nothing.
+const zipServer=new Server(),zipMirror=new MirroredFiles({scope:'archive-import',server:zipServer,retryMs:0});zipServer.offline=true;
+const archive=await zipMirror.write('/source.zip','zip bytes');await pause();const entries=[{path:'/Extract/Nested',directory:true},{path:'/Extract/Nested/note.txt',directory:false,data:new TextEncoder().encode('inside')},{path:'/Extract/Empty',directory:true}];
+await assert.rejects(()=>zipMirror.importTree('/Extract',entries,'/source.zip','stale'),/ZIP changed/);assert.deepEqual((await zipMirror.list('/')).entries.map(x=>x.path),['/source.zip']);
+await assert.rejects(()=>zipMirror.importTree('/Extract',[{path:'/Extract/missing/file',directory:false,data:new Uint8Array()}],'/source.zip',archive.version),/parent/);
+await assert.rejects(()=>zipMirror.importTree('/Extract',[{path:'/Extract/../escape',directory:false,data:new Uint8Array()}],'/source.zip',archive.version));
+const attemptsImport=await Promise.allSettled([zipMirror.importTree('/Extract',entries,'/source.zip',archive.version),zipMirror.importTree('/Extract',entries,'/source.zip',archive.version)]);assert.equal(attemptsImport.filter(x=>x.status==='fulfilled').length,1);
+assert.equal(new TextDecoder().decode((await zipMirror.read('/Extract/Nested/note.txt')).data),'inside');assert.equal((await zipMirror.list('/Extract/Empty')).entries.length,0);
+zipServer.offline=false;await zipMirror.sync();assert.equal(new TextDecoder().decode((await zipServer.read('Extract/Nested/note.txt')).data),'inside');assert.ok(zipServer.files.has('Extract/Empty'));zipMirror.close();
 const server=new Server(),a=new MirroredFiles({scope:'issuer:user-a',server,retryMs:0}),b=new MirroredFiles({scope:'issuer:user-b',server:new Server(),retryMs:0});
 assert.throws(()=>filePath('/../escape'));assert.throws(()=>filePath('/.secret'));
 server.offline=true;const first=await a.write('/note.txt','offline');await pause();assert.equal((await a.read('/note.txt')).status,'pending');assert.deepEqual((await b.list('/')).entries,[]);
