@@ -42,14 +42,14 @@ async def offload(function,*args,**kwargs):
         finally:raise
 
 class FileGateway:
-    def __init__(self, store, issuer_policy, *, base_path='', quotas=None, pacer=None, seconds_per_use=900, idle_seconds=5, max_requests_per_minute=256):
+    def __init__(self, store, issuer_policy, *, base_path='', quotas=None, pacer=None, seconds_per_use=900, idle_seconds=5, upload_idle_seconds=60, max_requests_per_minute=256):
         self.store=store;self.gate=Gatekeeper(store,issuer_policy,base_path=base_path,clock=store.clock)
         self.host=urlsplit(self.gate.origin).netloc;self.quotas=quotas or Quotas(store);self.pacer=pacer or Pacer()
-        if type(seconds_per_use) is not int or not 1<=seconds_per_use<=900 or not 0<idle_seconds<=10:
+        if type(seconds_per_use) is not int or not 1<=seconds_per_use<=900 or not 0<idle_seconds<=10 or not 0<upload_idle_seconds<=120:
             raise ValueError('Bounded transfer lifetime and idle timeout required')
         if type(max_requests_per_minute) is not int or not 1<=max_requests_per_minute<=100000:raise ValueError('Bounded request limit required')
         self.max_requests_per_minute=max_requests_per_minute
-        self.seconds=seconds_per_use;self.idle=idle_seconds;self.active=0
+        self.seconds=seconds_per_use;self.idle=idle_seconds;self.upload_idle=upload_idle_seconds;self.active=0
         self.window=0;self.requests=0
         self.client_source=Path(__file__).with_name('client.mjs').read_bytes()
 
@@ -76,11 +76,11 @@ class FileGateway:
         self.requests+=1
         if self.requests>self.max_requests_per_minute or self.active>=4:raise web.HTTPTooManyRequests(text='Gateway request capacity reached')
 
-    async def _read(self, request, *, principal=None, deadline, length=None):
+    async def _read(self, request, *, principal=None, deadline, length=None, idle=None):
         chunks=io.BytesIO();total=0
         length=request.content_length if length is None else length
         while total<length:
-            async with asyncio.timeout(min(self.idle,max(.001,deadline-time.monotonic()))):
+            async with asyncio.timeout(min(self.idle if idle is None else idle,max(.001,deadline-time.monotonic()))):
                 chunk=await request.content.read(min(self.pacer.burst if principal else 65536,length-total))
             if not chunk:raise Denied('Truncated gateway request')
             if principal:await self.pacer.wait(principal.sub,len(chunk),deadline)
@@ -88,10 +88,10 @@ class FileGateway:
         return chunks.getvalue()
 
     async def _upload(self,request,use,principal,deadline):
-        prefix=await self._read(request,principal=principal,deadline=deadline,length=4)
+        prefix=await self._read(request,principal=principal,deadline=deadline,length=4,idle=self.upload_idle)
         length=struct.unpack('>I',prefix)[0]
         if not 1<=length<=8192 or 4+length>request.content_length:raise Denied('Bounded upload metadata required')
-        raw=await self._read(request,principal=principal,deadline=deadline,length=length)
+        raw=await self._read(request,principal=principal,deadline=deadline,length=length,idle=self.upload_idle)
         metadata=use.decode(raw)
         operation=metadata.get('operation')
         exact(metadata,['resource','operation','path','format','size','sha256']+(['previousSHA256'] if operation=='replace' else []))
@@ -106,7 +106,7 @@ class FileGateway:
         with tempfile.TemporaryFile(mode='w+b') as temporary:
             seen=0;hasher=hashlib.sha256()
             while seen<size:
-                async with asyncio.timeout(min(self.idle,max(.001,deadline-time.monotonic()))):
+                async with asyncio.timeout(min(self.upload_idle,max(.001,deadline-time.monotonic()))):
                     chunk=await request.content.read(min(self.pacer.burst,size-seen))
                 if not chunk:raise Denied('Truncated upload')
                 await self.pacer.wait(principal.sub,len(chunk),deadline)
