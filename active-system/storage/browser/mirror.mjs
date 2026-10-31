@@ -13,6 +13,10 @@ export function fileName(value){const name=String(value).trim();need(name&&!name
 const parent=path=>path.slice(0,path.lastIndexOf('/'))||'/';
 const name=path=>path.slice(path.lastIndexOf('/')+1);
 const bytes=value=>typeof value==='string'?new TextEncoder().encode(value):value instanceof Uint8Array?Uint8Array.from(value):value instanceof ArrayBuffer?new Uint8Array(value.slice(0)):null;
+// Blob values are kept out of IndexedDB's serialized-record size limit. Older
+// records contain ArrayBuffers; retain read/sync compatibility with them.
+const storedSize=value=>value instanceof Blob?value.size:value.byteLength;
+const storedBytes=async value=>new Uint8Array(value instanceof Blob?await value.arrayBuffer():value.slice(0));
 async function digest(value){return [...new Uint8Array(await crypto.subtle.digest('SHA-256',value))].map(b=>b.toString(16).padStart(2,'0')).join('');}
 export class MirrorConflict extends Error{constructor(message='This file changed on another device. Choose which copy to keep.'){super(message);this.name='MirrorConflict';}}
 export class MirroredFiles{
@@ -20,8 +24,10 @@ export class MirroredFiles{
   constructor({scope,server,valid=()=>true,onChange=()=>{},retryMs=15000}={}){
     need(typeof scope==='string'&&scope.length>0&&scope.length<=512&&server&&typeof valid==='function'&&typeof onChange==='function','Authenticated file mirror required.');
     this.#scope=scope;this.#server=server;this.#valid=valid;this.#listeners.add(onChange);
-    this.#online=()=>this.sync().catch(()=>{});globalThis.addEventListener?.('online',this.#online);
-    if(retryMs>0)this.#timer=setInterval(()=>{if(globalThis.navigator?.onLine!==false)this.sync().catch(()=>{});},retryMs);
+    this.#online=()=>{if(!this.#running)this.sync().catch(()=>{});};globalThis.addEventListener?.('online',this.#online);
+    // A slow transfer can exceed the retry period. Periodic retries must not
+    // keep requesting another full pass and prevent an explicit sync settling.
+    if(retryMs>0)this.#timer=setInterval(()=>{if(!this.#running&&globalThis.navigator?.onLine!==false)this.sync().catch(()=>{});},retryMs);
   }
   #check(){need(!this.#closed&&this.#valid(),'Account changed. Reopen your files.');}
   #changed(){for(const fn of this.#listeners)try{fn();}catch(e){console.error('File view update failed',e);}}
@@ -48,14 +54,14 @@ export class MirroredFiles{
   async #mutate(path,fn){return this.#tx('readwrite',(store,done,fail)=>{const request=store.index('scope').getAll(this.#scope);request.onsuccess=()=>{try{this.#check();const all=request.result,old=all.find(r=>r.path===path)||null;const [next,result]=fn(old,all);if(next===null)store.delete([this.#scope,path]);else if(next!==undefined)store.put(next);done(result);}catch(e){fail(e);}};request.onerror=()=>fail(request.error);});}
   async list(path='/'){
     path=filePath(path);const all=await this.#all();if(path!=='/'){const dir=all.find(r=>r.path===path&&!r.deleted);need(dir?.directory,'Folder not found.');}
-    return {entries:all.filter(r=>(!r.deleted||r.conflict)&&parent(r.path)===path).sort((a,b)=>a.path.localeCompare(b.path)).map(r=>({path:r.path,name:name(r.path),directory:r.directory,bytes:r.directory?null:r.data.byteLength,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'}))};
+    return {entries:all.filter(r=>(!r.deleted||r.conflict)&&parent(r.path)===path).sort((a,b)=>a.path.localeCompare(b.path)).map(r=>({path:r.path,name:name(r.path),directory:r.directory,bytes:r.directory?null:storedSize(r.data),version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'}))};
   }
   async status(){const all=await this.#all();return {pending:all.filter(r=>r.dirty&&!r.conflict).length,conflicts:all.filter(r=>r.conflict).length,error:this.#lastError,lastSynced:this.#lastSynced};}
-  async read(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');return {data:new Uint8Array(r.data.slice(0)),sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
+  async read(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');const data=await storedBytes(r.data);this.#check();return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
   async write(path,data,expected=null){
     path=filePath(path);need(path!=='/','Enter a filename.');const copy=bytes(data);need(copy&&copy.length<=MAX_FILE,'Files are limited to 128 MiB.');const sha256=await digest(copy);this.#check();
     const result=await this.#mutate(path,(old,all)=>{if(parent(path)!=='/'){const p=all.find(r=>r.path===parent(path));need(p&&!p.deleted&&p.directory,'Create the parent folder first.');}need(all.length<MAX_ENTRIES||old,'Browser file limit reached.');if(old?.moving)throw Error('Wait for this move to finish syncing.');if(expected===null?!!old:!old||old.deleted||old.directory||old.version!==expected)throw new MirrorConflict('This file changed; reload it before saving.');
-      const row={scope:this.#scope,path,directory:false,data:copy.buffer,sha256,base:old?.base??null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:!!old?.conflict};return [row,{path,version:row.version,sha256,status:row.conflict?'conflict':'pending'}];});
+      const row={scope:this.#scope,path,directory:false,data:new Blob([copy]),sha256,base:old?.base??null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:!!old?.conflict};return [row,{path,version:row.version,sha256,status:row.conflict?'conflict':'pending'}];});
     this.#changed();this.sync().catch(()=>{});return result;
   }
   async mkdir(path){path=filePath(path);need(path!=='/','Root already exists.');const result=await this.#mutate(path,(old,all)=>{if(parent(path)!=='/'){const p=all.find(r=>r.path===parent(path));need(p&&!p.deleted&&p.directory,'Create the parent folder first.');}need(all.length<MAX_ENTRIES,'Browser file limit reached.');if(old)throw new MirrorConflict('An item with that name already exists.');const row={scope:this.#scope,path,directory:true,data:null,sha256:null,base:null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:false};return [row,{path,version:row.version,status:'pending'}];});this.#changed();this.sync().catch(()=>{});return result;}
@@ -79,13 +85,15 @@ export class MirroredFiles{
   async #conflict(row){await this.#update(row.path,current=>current?.version===row.version?[{...current,conflict:true},true]:[undefined,false]);}
   async #install(row,remote){await this.#update(row.path,current=>{if(row.version===null?!!current:!current||current.version!==row.version||current.dirty)return [undefined,false];return [{scope:this.#scope,path:row.path,directory:remote.directory,data:remote.data??null,sha256:remote.sha256??null,base:remote.directory?'dir':remote.sha256,version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false},true];});}
   async #pass(){
-    this.#check();let remote=await this.#remoteInventory(),rows=await this.#all();this.#check();
+    this.#check();const canVersion=typeof this.#server.supportsVersion==='function'&&typeof this.#server.version==='function'&&await this.#server.supportsVersion();
+    const version=async(path,item)=>item?.sha256?item:canVersion?await this.#server.version(path):await this.#server.read(path);
+    let remote=await this.#remoteInventory(),rows=await this.#all();this.#check();
     // Recover an interrupted rename by checking both server paths and hashes.
     for(const source of rows.filter(r=>r.moving&&r.moveTo)){
       const destination=rows.find(r=>r.path===source.moveTo&&r.moving&&r.moveFrom===source.path);
       need(destination,'Move journal is incomplete.');const from=remote.get(source.path),to=remote.get(destination.path);
-      const original=from&&!from.directory?await this.#server.read(source.path.slice(1)):null;
-      const target=to&&!to.directory?await this.#server.read(destination.path.slice(1)):null;
+      const original=from&&!from.directory?await version(source.path.slice(1),from):null;
+      const target=to&&!to.directory?await version(destination.path.slice(1),to):null;
       if(!from&&target?.sha256===source.base){await this.#finishMove(source,destination);continue;}
       if(from&&!from.directory&&original?.sha256===source.base&&!to){await this.#server.rename(source.path.slice(1),destination.path.slice(1),source.base);await this.#finishMove(source,destination);continue;}
       const changed=!from||from.directory||original?.sha256!==source.base;
@@ -102,11 +110,11 @@ export class MirroredFiles{
         else{if(!existing){await this.#server.mkdir(target);remote.set(row.path,{directory:true});}await this.#ack(row,'dir');}
       }else{
         if(existing?.directory){await this.#conflict(row);continue;}
-        const current=existing?await this.#server.read(target):null;this.#check();
+        const current=existing?await version(target,existing):null;this.#check();
         if(row.deleted){if(!current){await this.#ack(row,null,{remove:true});continue;}if(current.sha256!==row.base){await this.#conflict(row);continue;}await this.#server.remove(target,row.base);remote.delete(row.path);await this.#ack(row,null,{remove:true});}
         else if(current?.sha256===row.sha256)await this.#ack(row,row.sha256);
         else if((current?.sha256??null)!==row.base)await this.#conflict(row);
-        else{await this.#server.write(target,new Uint8Array(row.data),row.base);remote.set(row.path,{directory:false});await this.#ack(row,row.sha256);}
+        else{await this.#server.write(target,await storedBytes(row.data),row.base);remote.set(row.path,{directory:false,sha256:row.sha256});await this.#ack(row,row.sha256);}
       }
     }
     // Re-read current local rows: an edit can arrive while the server is slow.
@@ -114,7 +122,7 @@ export class MirroredFiles{
     for(const [path,item] of remote){this.#check();const row=local.get(path);if(row?.dirty)continue;
       if(item.directory){if(!row)await this.#install({path,version:null},{directory:true});else if(!row.directory)await this.#conflict({...row,dirty:true});continue;}
       if(row?.directory){await this.#conflict({...row,dirty:true});continue;}
-      let value;try{value=await this.#server.read(path.slice(1));}catch(error){issues.push('Could not sync '+path+': '+(error.message||'server file unavailable'));continue;}this.#check();if(!row||row.sha256!==value.sha256)await this.#install({path,version:row?.version??null},{directory:false,data:value.data.buffer.slice(value.data.byteOffset,value.data.byteOffset+value.data.byteLength),sha256:value.sha256});
+      let value;try{value=await version(path.slice(1),item);if(!row||row.sha256!==value.sha256){if(canVersion)value=await this.#server.read(path.slice(1));this.#check();await this.#install({path,version:row?.version??null},{directory:false,data:new Blob([value.data]),sha256:value.sha256});}}catch(error){issues.push('Could not sync '+path+': '+(error.message||'server file unavailable'));continue;}
     }
     for(const row of fresh){if(row.dirty||remote.has(row.path))continue;if(row.directory&&fresh.some(child=>child.dirty&&child.path.startsWith(row.path+'/')))continue;await this.#update(row.path,current=>current&&!current.dirty&&current.version===row.version?[null,true]:[undefined,false]);}
     this.#changed();if(issues.length)throw Error(issues[0]+(issues.length>1?' (and '+(issues.length-1)+' other files)':''));return {pending:(await this.#all()).filter(r=>r.dirty).length};
@@ -123,7 +131,7 @@ export class MirroredFiles{
   async resolve(path,choice,expected){path=filePath(path);need(['local','server'].includes(choice),'Choose which copy to keep.');const row=await this.#get(path);if(!row||!row.conflict||row.version!==expected)throw new MirrorConflict('This item changed; reload before resolving.');need(!row.directory,'Folder conflicts require manual resolution.');
     const inventory=await this.#remoteInventory(),entry=inventory.get(path);need(!entry?.directory,'The server has a folder at this path.');const remote=entry?await this.#server.read(path.slice(1)):null;this.#check();
     if(choice==='local'){await this.#update(path,current=>{if(!current||current.version!==expected)throw new MirrorConflict();return [{...current,base:remote?.sha256??null,conflict:false,dirty:true},true];});}
-    else{await this.#update(path,current=>{if(!current||current.version!==expected)throw new MirrorConflict();if(!remote)return [null,true];return [{scope:this.#scope,path,directory:false,data:remote.data.buffer.slice(remote.data.byteOffset,remote.data.byteOffset+remote.data.byteLength),sha256:remote.sha256,base:remote.sha256,version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false},true];});}
+    else{await this.#update(path,current=>{if(!current||current.version!==expected)throw new MirrorConflict();if(!remote)return [null,true];return [{scope:this.#scope,path,directory:false,data:new Blob([remote.data]),sha256:remote.sha256,base:remote.sha256,version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false},true];});}
     this.#changed();if(choice==='local')this.sync().catch(()=>{});
   }
   async persistence(){return {supported:typeof navigator.storage?.persist==='function'&&typeof navigator.storage?.persisted==='function',persistent:typeof navigator.storage?.persisted==='function'&&await navigator.storage.persisted()===true};}
