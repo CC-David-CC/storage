@@ -80,6 +80,25 @@ export class MirroredFiles{
     this.#hasPending=true;this.#changed();this.#queueSync();return result;
   }
   async mkdir(path){path=filePath(path);need(path!=='/','Root already exists.');const result=await this.#mutate(path,(old,all)=>{if(parent(path)!=='/'){const p=all.find(r=>r.path===parent(path));need(p&&!p.deleted&&p.directory,'Create the parent folder first.');}need(all.length<MAX_ENTRIES,'Browser file limit reached.');if(old)throw new MirrorConflict('An item with that name already exists.');const row={scope:this.#scope,path,directory:true,data:null,sha256:null,base:null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:false};return [row,{path,version:row.version,status:'pending'}];});this.#hasPending=true;this.#changed();this.#queueSync();return result;}
+  // Copy a consistent local snapshot in one transaction. The usual mirror
+  // queue then synchronizes its entries; server synchronization is not atomic.
+  async copyTree(source,destination,expected){
+    source=filePath(source);destination=filePath(destination);
+    need(source!=='/'&&destination!=='/'&&typeof expected==='string','Choose a folder to copy.');
+    need(destination!==source&&!destination.startsWith(source+'/'),'Choose a destination outside the folder being copied.');
+    const result=await this.#tx('readwrite',(store,done,fail)=>{const req=store.index('scope').getAll(this.#scope);req.onsuccess=()=>{try{
+      this.#check();const all=req.result,root=all.find(r=>r.path===source);
+      if(!root||root.deleted||!root.directory||root.version!==expected)throw new MirrorConflict('This folder changed; reload before copying.');
+      const tree=all.filter(r=>r.path===source||r.path.startsWith(source+'/'));
+      need(!tree.some(r=>r.conflict||r.moving),'Resolve conflicts and finish moves in this folder before copying.');
+      const present=tree.filter(r=>!r.deleted);need(all.length+present.length<=MAX_ENTRIES,'Browser file limit reached.');
+      const existing=new Set(all.map(r=>r.path));
+      if(parent(destination)!=='/'){const dir=all.find(r=>r.path===parent(destination));need(dir&&!dir.deleted&&dir.directory&&!dir.conflict&&!dir.moving,'Choose an available destination folder.');}
+      const copies=present.map(r=>{const path=filePath(destination+r.path.slice(source.length));need(!existing.has(path),'An item with that name already exists.');return {scope:this.#scope,path,directory:r.directory,data:r.data,sha256:r.sha256,base:null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:false};});
+      for(const row of copies)store.put(row);done({path:destination,entries:copies.length});
+    }catch(e){fail(e);}};req.onerror=()=>fail(req.error);});
+    this.#hasPending=true;this.#changed();this.#queueSync();return result;
+  }
   async remove(path,expected){path=filePath(path);need(path!=='/'&&typeof expected==='string','A saved version is required.');await this.#mutate(path,(old,all)=>{need(!all.some(r=>!r.deleted&&parent(r.path)===path),'Folder must be empty before deleting.');if(old?.moving)throw Error('Wait for this move to finish syncing.');if(!old||old.deleted||old.version!==expected)throw new MirrorConflict('This item changed; reload before deleting.');return [{...old,version:crypto.randomUUID(),dirty:true,deleted:true,conflict:!!old.conflict},true];});this.#hasPending=true;this.#changed();this.#queueSync();}
   // Journal both sides atomically; server rename is version checked.
   async move(source,destination,expected){
