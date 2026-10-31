@@ -20,14 +20,21 @@ const storedBytes=async value=>new Uint8Array(value instanceof Blob?await value.
 async function digest(value){return [...new Uint8Array(await crypto.subtle.digest('SHA-256',value))].map(b=>b.toString(16).padStart(2,'0')).join('');}
 export class MirrorConflict extends Error{constructor(message='This file changed on another device. Choose which copy to keep.'){super(message);this.name='MirrorConflict';}}
 export class MirroredFiles{
-  #scope;#server;#valid;#db;#opening;#running;#closed=false;#listeners=new Set();#timer;#online;#again=false;#lastError=null;#lastSynced=null;#checked=new Map();
+  #scope;#server;#valid;#db;#opening;#running;#closed=false;#listeners=new Set();#timer;#retryMs;#rateFailures=0;#online;#again=false;#lastError=null;#lastSynced=null;#checked=new Map();
   constructor({scope,server,valid=()=>true,onChange=()=>{},retryMs=15000}={}){
     need(typeof scope==='string'&&scope.length>0&&scope.length<=512&&server&&typeof valid==='function'&&typeof onChange==='function','Authenticated file mirror required.');
-    this.#scope=scope;this.#server=server;this.#valid=valid;this.#listeners.add(onChange);
+    need(typeof retryMs==='number'&&Number.isFinite(retryMs)&&retryMs>=0,'Invalid sync retry interval.');
+    this.#scope=scope;this.#server=server;this.#valid=valid;this.#retryMs=retryMs;this.#listeners.add(onChange);
     this.#online=()=>{if(!this.#running)this.sync().catch(()=>{});};globalThis.addEventListener?.('online',this.#online);
-    // A slow transfer can exceed the retry period. Periodic retries must not
-    // keep requesting another full pass and prevent an explicit sync settling.
-    if(retryMs>0)this.#timer=setInterval(()=>{if(!this.#running&&globalThis.navigator?.onLine!==false)this.sync().catch(()=>{});},retryMs);
+    this.#schedule();
+  }
+  // Keep polling bounded and spread clients apart after a shared rate limit.
+  // A manual sync or a new local write still attempts immediately.
+  #schedule(){
+    clearTimeout(this.#timer);if(this.#closed||!this.#retryMs)return;
+    const base=Math.min(120000,this.#retryMs*2**Math.min(this.#rateFailures,8));
+    const delay=Math.max(1,Math.round(base*(0.8+0.4*Math.random())));
+    this.#timer=setTimeout(()=>{this.#timer=null;if(this.#closed)return;if(!this.#running&&globalThis.navigator?.onLine!==false)this.sync().catch(()=>{});else this.#schedule();},delay);
   }
   #check(){need(!this.#closed&&this.#valid(),'Account changed. Reopen your files.');}
   #changed(){for(const fn of this.#listeners)try{fn();}catch(e){console.error('File view update failed',e);}}
@@ -133,7 +140,7 @@ export class MirroredFiles{
     for(const row of fresh){if(row.dirty||remote.has(row.path))continue;if(row.directory&&fresh.some(child=>child.dirty&&child.path.startsWith(row.path+'/')))continue;await this.#update(row.path,current=>current&&!current.dirty&&current.version===row.version?[null,true]:[undefined,false]);}
     this.#changed();if(issues.length)throw Error(issues[0]+(issues.length>1?' (and '+(issues.length-1)+' other files)':''));this.#checked.clear();return {pending:(await this.#all()).filter(r=>r.dirty).length};
   }
-  sync(){this.#check();if(this.#running){this.#again=true;return this.#running;}const run=async()=>{let result;do{this.#again=false;result=await this.#pass();}while(this.#again&&!this.#closed&&this.#valid());return result;};const task=(globalThis.navigator?.locks?.request?navigator.locks.request('codi-mirror:'+this.#scope,{mode:'exclusive'},run):run()).then(result=>{this.#lastError=null;this.#lastSynced=Date.now();this.#changed();return result;},error=>{if(!this.#closed){this.#lastError=error.message||'Server sync unavailable.';this.#changed();}throw error;}).finally(()=>{if(this.#running===task)this.#running=null;});this.#running=task;return task;}
+  sync(){this.#check();if(this.#running){this.#again=true;return this.#running;}const run=async()=>{let result;do{this.#again=false;result=await this.#pass();}while(this.#again&&!this.#closed&&this.#valid());return result;};const task=(globalThis.navigator?.locks?.request?navigator.locks.request('codi-mirror:'+this.#scope,{mode:'exclusive'},run):run()).then(result=>{this.#rateFailures=0;this.#lastError=null;this.#lastSynced=Date.now();this.#changed();return result;},error=>{if(!this.#closed){if(error?.status===429)this.#rateFailures=Math.min(this.#rateFailures+1,8);else this.#rateFailures=0;this.#lastError=error.message||'Server sync unavailable.';this.#changed();}throw error;}).finally(()=>{if(this.#running===task)this.#running=null;this.#schedule();});this.#running=task;return task;}
   async resolve(path,choice,expected){path=filePath(path);need(['local','server'].includes(choice),'Choose which copy to keep.');const row=await this.#get(path);if(!row||!row.conflict||row.version!==expected)throw new MirrorConflict('This item changed; reload before resolving.');need(!row.directory,'Folder conflicts require manual resolution.');
     const inventory=await this.#remoteInventory(),entry=inventory.get(path);need(!entry?.directory,'The server has a folder at this path.');const remote=entry?await this.#server.read(path.slice(1)):null;this.#check();
     if(choice==='local'){await this.#update(path,current=>{if(!current||current.version!==expected)throw new MirrorConflict();return [{...current,base:remote?.sha256??null,conflict:false,dirty:true},true];});}
@@ -142,5 +149,5 @@ export class MirroredFiles{
   }
   async persistence(){return {supported:typeof navigator.storage?.persist==='function'&&typeof navigator.storage?.persisted==='function',persistent:typeof navigator.storage?.persisted==='function'&&await navigator.storage.persisted()===true};}
   async requestPersistence(){need(navigator.userActivation?.isActive,'Use the storage protection button.');need(typeof navigator.storage?.persist==='function','Storage protection is unavailable.');await navigator.storage.persist();return this.persistence();}
-  close(){if(this.#closed)return;this.#closed=true;clearInterval(this.#timer);globalThis.removeEventListener?.('online',this.#online);this.#listeners.clear();this.#checked.clear();this.#db?.close();this.#db=null;}
+  close(){if(this.#closed)return;this.#closed=true;clearTimeout(this.#timer);globalThis.removeEventListener?.('online',this.#online);this.#listeners.clear();this.#checked.clear();this.#db?.close();this.#db=null;}
 }
