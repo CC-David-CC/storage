@@ -86,7 +86,8 @@ export class MirroredFiles{
   async #install(row,remote){await this.#update(row.path,current=>{if(row.version===null?!!current:!current||current.version!==row.version||current.dirty)return [undefined,false];return [{scope:this.#scope,path:row.path,directory:remote.directory,data:remote.data??null,sha256:remote.sha256??null,base:remote.directory?'dir':remote.sha256,version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false},true];});}
   async #pass(){
     this.#check();const canVersion=typeof this.#server.supportsVersion==='function'&&typeof this.#server.version==='function'&&await this.#server.supportsVersion();
-    const version=async(path,item)=>item?.sha256?item:canVersion?await this.#server.version(path):await this.#server.read(path);
+    const canBatch=canVersion&&typeof this.#server.supportsVersionBatch==='function'&&typeof this.#server.versions==='function'&&await this.#server.supportsVersionBatch(),batchCache=new Map();
+    const version=async(path,item)=>item?.sha256?item:batchCache.get(path)??(canVersion?await this.#server.version(path):await this.#server.read(path));
     let remote=await this.#remoteInventory(),rows=await this.#all();this.#check();
     // Recover an interrupted rename by checking both server paths and hashes.
     for(const source of rows.filter(r=>r.moving&&r.moveTo)){
@@ -119,14 +120,15 @@ export class MirroredFiles{
     }
     // Re-read current local rows: an edit can arrive while the server is slow.
     const fresh=await this.#all(),local=new Map(fresh.map(r=>[r.path,r])),issues=[];
-    for(const [path,item] of remote){this.#check();const row=local.get(path);if(row?.dirty)continue;
+    const entries=[...remote];
+    for(let index=0;index<entries.length;index++){const [path,item]=entries[index];this.#check();const row=local.get(path);if(row?.dirty)continue;
       if(item.directory){if(!row)await this.#install({path,version:null},{directory:true});else if(!row.directory)await this.#conflict({...row,dirty:true});continue;}
       if(row?.directory){await this.#conflict({...row,dirty:true});continue;}
       // Keep verified progress only while a scan is incomplete. A local edit
       // changes the row version and invalidates the entry. The next complete
       // scan starts fresh, so external edits are still eventually discovered.
       if(row&&this.#checked.get(path)===row.version)continue;
-      let value;try{value=await version(path.slice(1),item);if(!row||row.sha256!==value.sha256){if(canVersion)value=await this.#server.read(path.slice(1));this.#check();await this.#install({path,version:row?.version??null},{directory:false,data:new Blob([value.data]),sha256:value.sha256});}const current=await this.#get(path);if(current&&!current.dirty&&!current.directory&&current.sha256===value.sha256)this.#checked.set(path,current.version);}catch(error){if(error?.status===429)throw error;issues.push('Could not sync '+path+': '+(error.message||'server file unavailable'));continue;}
+      let value;try{if(canBatch&&!item.sha256&&!batchCache.has(path.slice(1))){const paths=[];let bytes=0;for(let i=index;i<entries.length&&paths.length<16;i++){const [other,record]=entries[i],r=local.get(other),relative=other.slice(1),length=new TextEncoder().encode(relative).length;if(record.directory||record.sha256||r?.dirty||(r&&this.#checked.get(other)===r.version)||batchCache.has(relative))continue;if(bytes+length>8192)break;paths.push(relative);bytes+=length;}if(paths.length){const values=await this.#server.versions(paths);this.#check();need(Array.isArray(values)&&values.length===paths.length,'Invalid batch file versions.');for(let i=0;i<paths.length;i++)batchCache.set(paths[i],values[i]);}}value=await version(path.slice(1),item);if(!row||row.sha256!==value.sha256){if(canVersion)value=await this.#server.read(path.slice(1));this.#check();await this.#install({path,version:row?.version??null},{directory:false,data:new Blob([value.data]),sha256:value.sha256});}const current=await this.#get(path);if(current&&!current.dirty&&!current.directory&&current.sha256===value.sha256)this.#checked.set(path,current.version);}catch(error){if(error?.status===429)throw error;issues.push('Could not sync '+path+': '+(error.message||'server file unavailable'));continue;}
     }
     for(const row of fresh){if(row.dirty||remote.has(row.path))continue;if(row.directory&&fresh.some(child=>child.dirty&&child.path.startsWith(row.path+'/')))continue;await this.#update(row.path,current=>current&&!current.dirty&&current.version===row.version?[null,true]:[undefined,false]);}
     this.#changed();if(issues.length)throw Error(issues[0]+(issues.length>1?' (and '+(issues.length-1)+' other files)':''));this.#checked.clear();return {pending:(await this.#all()).filter(r=>r.dirty).length};

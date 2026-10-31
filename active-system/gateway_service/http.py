@@ -118,6 +118,10 @@ class FileGateway:
 
     def _dispatch(self, principal, request):
         operation=request.get('operation')
+        if operation=='versions':
+            exact(request,['resource','operation','paths'])
+            if request['resource']!='my-files':raise Denied('Personal file resource required')
+            return {'entries':self.store.version_batch(principal,request['paths'])}
         common=['resource','operation','path']
         extras={'create':['data'],'replace':['data','previousSHA256'],'delete':['previousSHA256'],'rename':['destination','previousSHA256'],'word-count':['previousSHA256']}
         if operation not in ('list','read','version','mkdir','create','replace','delete','rename','word-count'):raise Denied('File operation not permitted')
@@ -161,10 +165,11 @@ class FileGateway:
     async def handle(self, request):
         admitted=False;transfer=None;response=None;read_fd=None
         try:
-            if request.method=='GET' and request.raw_path in ('/gateway/client.mjs','/gateway/capabilities','/gateway/upload-capabilities','/healthz'):
+            if request.method=='GET' and request.raw_path in ('/gateway/client.mjs','/gateway/capabilities','/gateway/version-batch-capabilities','/gateway/upload-capabilities','/healthz'):
                 if request.headers.get('Host')!=self.host:raise web.HTTPForbidden()
                 if request.raw_path=='/healthz':return self._response({'status':'ok','scope':'personal-files'})
                 if request.raw_path=='/gateway/capabilities':return self._response({'version':'codi-file-capabilities/1','fileVersion':True})
+                if request.raw_path=='/gateway/version-batch-capabilities':return self._response({'version':'codi-file-version-batch/1','maxPaths':16})
                 if request.raw_path=='/gateway/upload-capabilities':return self._response({'version':'codi-binary-upload/1','maxBytes':MAX_FILE_BYTES})
                 return web.Response(body=self.client_source,content_type='text/javascript',headers={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'})
             self._headers(request);self.active+=1;admitted=True

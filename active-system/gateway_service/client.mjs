@@ -101,6 +101,18 @@ export class UserFiles{
     requireThat(result&&Object.keys(result).length===2&&Number.isSafeInteger(result.bytes)&&result.bytes>=0&&result.bytes<=MAX_FILE&&typeof result.sha256==='string'&&/^[0-9a-f]{64}$/.test(result.sha256),'Invalid file version response');
     return {bytes:result.bytes,sha256:result.sha256};
   }
+  async supportsVersionBatch(){
+    this.check();const response=await fetch(this.base+'/version-batch-capabilities',{method:'GET',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:'no-referrer',signal:AbortSignal.timeout(10000)});
+    this.check();if(response.status===404)return false;
+    if(!response.ok)throw new FileRequestError('File version capabilities unavailable',response.status);
+    const text=await response.text();requireThat(text.length<=1024,'Invalid file version capabilities');let value;try{value=JSON.parse(text);}catch{throw Error('Invalid file version capabilities');}
+    return !!(value&&Object.keys(value).length===2&&value.version==='codi-file-version-batch/1'&&value.maxPaths===16);
+  }
+  async versions(paths){
+    requireThat(Array.isArray(paths)&&paths.length>0&&paths.length<=16&&paths.every(p=>typeof p==='string')&&new Set(paths).size===paths.length,'Invalid file version batch');
+    const result=await this.request('versions',{paths});requireThat(result&&Object.keys(result).length===1&&Array.isArray(result.entries)&&result.entries.length===paths.length,'Invalid file version batch response');
+    return result.entries.map((entry,i)=>{requireThat(entry&&entry.path===paths[i],'Invalid file version batch path');if(entry.deferred===true){requireThat(Object.keys(entry).length===2,'Invalid deferred file version');return null;}requireThat(Object.keys(entry).length===3&&Number.isSafeInteger(entry.bytes)&&entry.bytes>=0&&entry.bytes<=MAX_FILE&&typeof entry.sha256==='string'&&/^[0-9a-f]{64}$/.test(entry.sha256),'Invalid file version batch item');return {bytes:entry.bytes,sha256:entry.sha256};});
+  }
   async read(path){
     const result=await this.request('read',{path}),data=decode(result.data);
     const actual=[...new Uint8Array(await crypto.subtle.digest('SHA-256',data))].map(b=>b.toString(16).padStart(2,'0')).join('');

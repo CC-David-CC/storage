@@ -293,6 +293,46 @@ class UserStore:
                 for descriptor in [fd,parent,home]:
                     if descriptor is not None:os.close(descriptor)
 
+    def version_batch(self, principal, paths, *, maximum_total_bytes=32*1024*1024):
+        """Hash a bounded group of private files, deferring large or missing files.
+
+        Every path is opened beneath the authorized account home with the same
+        ownership and no-symlink checks as a normal read. The byte budget bounds
+        hashing work; callers use the ordinary version request for deferred files.
+        """
+        maximum_total_bytes=integer(maximum_total_bytes,1,32*1024*1024)
+        if not isinstance(paths,list) or not 1<=len(paths)<=16 or any(not isinstance(path,str) for path in paths):
+            raise Denied('A bounded set of unique file paths is required')
+        if len(set(paths))!=len(paths) or any(not parts(path) for path in paths):raise Denied('Unique file paths required')
+        if sum(len(path.encode('utf-8')) for path in paths)>8192:raise Denied('Batch paths are too large')
+        result=[];remaining=maximum_total_bytes
+        for path in paths:
+            with self.lock(),self.db() as db:
+                home=self._authorized(db,principal,'read');parent=fd=None
+                try:
+                    try:
+                        parent,name=self._parent(home,path)
+                        fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,dir_fd=parent)
+                    except FileNotFoundError:
+                        result.append({'path':path,'deferred':True});continue
+                    info=self._data_stat(fd)
+                    if info.st_size>min(self.per_user_bytes,128*1024*1024):raise Denied('File size limit exceeded')
+                    if info.st_size>remaining:
+                        result.append({'path':path,'deferred':True});continue
+                    digest=hashlib.sha256();size=0
+                    while chunk:=os.read(fd,65536):
+                        size+=len(chunk)
+                        if size>remaining:raise Conflict('File changed while reading')
+                        digest.update(chunk)
+                    end=os.fstat(fd)
+                    if size!=info.st_size or (end.st_mtime_ns,end.st_ctime_ns)!=(info.st_mtime_ns,info.st_ctime_ns):
+                        raise Conflict('File changed while reading')
+                    remaining-=size;result.append({'path':path,'bytes':size,'sha256':digest.hexdigest()})
+                finally:
+                    for descriptor in [fd,parent,home]:
+                        if descriptor is not None:os.close(descriptor)
+        return result
+
     def list(self, principal, path=''):
         with self.lock(), self.db() as db:
             fd = self._authorized(db, principal, 'list')
