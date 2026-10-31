@@ -357,6 +357,25 @@ class UserStore:
             finally:
                 os.close(fd)
 
+    def inventory(self, principal, *, max_directories=128, max_entries=2048, max_path_bytes=524288):
+        """Return a bounded account tree, or ask the client to use ordinary listings.
+
+        Each directory uses the normal list authorization and no-follow checks.
+        Nothing is returned if the tree exceeds a bound; clients must never
+        interpret an incomplete tree as evidence that a file was deleted.
+        """
+        queue=[''];result=[];directories=0;path_bytes=0
+        while queue:
+            if directories>=max_directories:return {'complete':False,'entries':[]}
+            directory=queue.pop(0);directories+=1
+            for item in self.list(principal,directory):
+                path=(directory+'/' if directory else '')+item['name'];parts(path)
+                path_bytes+=len(path.encode('utf-8'))
+                if len(result)>=max_entries or path_bytes>max_path_bytes:return {'complete':False,'entries':[]}
+                result.append({'path':path,'directory':item['directory']})
+                if item['directory']:queue.append(path)
+        return {'complete':True,'entries':result}
+
     def _usage(self, *, clean_staging=False):
         total_size = total_entries = 0;users = {}
         for root in self.users_path.iterdir():

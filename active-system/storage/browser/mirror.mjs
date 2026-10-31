@@ -86,7 +86,13 @@ export class MirroredFiles{
     return this.#tx('readwrite',(store,done,fail)=>{const req=store.index('scope').getAll(this.#scope);req.onsuccess=()=>{try{const all=req.result,a=all.find(r=>r.path===source.path),b=all.find(r=>r.path===destination.path);if(!a||!b||a.version!==source.version||b.version!==destination.version||a.moveTo!==b.path||b.moveFrom!==a.path)throw new MirrorConflict('Move changed in another tab.');if(restore){const {moving,moveTo,...prior}=a;store.put({...prior,deleted:false,dirty:conflict,conflict,version:crypto.randomUUID()});store.delete([this.#scope,b.path]);}else{const {moving,moveFrom,...next}=b;store.put({...next,base:source.base,dirty:false,conflict:false,version:crypto.randomUUID()});store.delete([this.#scope,a.path]);}done(true);}catch(e){fail(e);}};req.onerror=()=>fail(req.error);});
   }
   async #remoteInventory(){
-    const inventory=new Map(),queue=['/'];while(queue.length){this.#check();const dir=queue.shift(),result=await this.#server.list(dir==='/'?'':dir.slice(1));this.#check();need(Array.isArray(result.entries),'Invalid server folder listing.');
+    const inventory=new Map();
+    if(typeof this.#server.supportsInventory==='function'&&typeof this.#server.inventory==='function'&&await this.#server.supportsInventory()){
+      this.#check();const snapshot=await this.#server.inventory();this.#check();need(snapshot&&typeof snapshot.complete==='boolean'&&Array.isArray(snapshot.entries)&&snapshot.entries.length<=2048,'Invalid server inventory.');
+      if(snapshot.complete){for(const item of snapshot.entries){need(item&&typeof item.path==='string'&&!item.path.startsWith('/')&&typeof item.directory==='boolean','Invalid server inventory entry.');const path=filePath('/'+item.path);need(!inventory.has(path),'Duplicate server inventory entry.');inventory.set(path,{directory:item.directory});}for(const [path] of inventory){const dir=parent(path);need(dir==='/'||inventory.get(dir)?.directory===true,'Invalid server inventory hierarchy.');}return inventory;}
+      need(snapshot.entries.length===0,'Incomplete server inventory.');
+    }
+    const queue=['/'];while(queue.length){this.#check();const dir=queue.shift(),result=await this.#server.list(dir==='/'?'':dir.slice(1));this.#check();need(Array.isArray(result.entries),'Invalid server folder listing.');
       for(const item of result.entries){need(item&&typeof item.name==='string'&&typeof item.directory==='boolean','Invalid server file listing.');const path=filePath((dir==='/'?'':dir)+'/'+item.name);need(!inventory.has(path)&&inventory.size<MAX_ENTRIES,'Server file list exceeds the browser limit.');inventory.set(path,{directory:item.directory});if(item.directory)queue.push(path);}
     }return inventory;
   }
