@@ -58,7 +58,7 @@ export class UserFiles{
     const challenge=await this.post(this.base+'/challenge',JSON.stringify({key:publicKey,request_sha256:requestSha}));
     requireThat(typeof challenge.nonce==='string'&&/^[A-Za-z0-9_-]{43}$/.test(challenge.nonce)&&challenge.request_sha256===requestSha,'Invalid gateway challenge');
     const authorize=this.api+'/gateway/authorize';
-    const issuerNonce=await this.post(this.api+'/gateway/challenge',JSON.stringify({key:publicKey,path:authorize}));
+    const issuerNonce=await this.post(this.api+'/gateway/challenge',JSON.stringify({key:publicKey,path:authorize}),{token:session.token});
     const signedRequest=JSON.stringify({nonce:challenge.nonce,request_sha256:requestSha}),now=nowSeconds();
     const issuerProof=await signJws({v:1,nonce:issuerNonce.nonce,iss:sid,aud:this.config.identity.issuer,method:'POST',path:authorize,iat:now,exp:now+60,request_sha256:await hash(signedRequest)},key,PROOF_TYPE);
     const result=await this.post(authorize,JSON.stringify({request:signedRequest,proof:issuerProof}),{token:session.token});
