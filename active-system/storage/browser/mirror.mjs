@@ -25,8 +25,8 @@ export class MirroredFiles{
     need(typeof scope==='string'&&scope.length>0&&scope.length<=512&&server&&typeof valid==='function'&&typeof onChange==='function','Authenticated file mirror required.');
     need(typeof retryMs==='number'&&Number.isFinite(retryMs)&&retryMs>=0,'Invalid sync retry interval.');
     this.#scope=scope;this.#server=server;this.#valid=valid;this.#retryMs=retryMs;this.#listeners.add(onChange);
-    this.#online=()=>{if(!this.#running)this.sync().catch(()=>{});};globalThis.addEventListener?.('online',this.#online);
-    this.#visibility=()=>{if(this.#closed||!this.#retryMs)return;if(globalThis.document?.visibilityState==='visible'&&this.#lastSynced!==null&&Date.now()-this.#lastSynced>=this.#retryMs*2&&!this.#running&&globalThis.navigator?.onLine!==false)this.sync().catch(()=>{});else this.#schedule();};globalThis.document?.addEventListener?.('visibilitychange',this.#visibility);
+    this.#online=()=>{if(!this.#running)this.#queueSync();};globalThis.addEventListener?.('online',this.#online);
+    this.#visibility=()=>{if(this.#closed||!this.#retryMs)return;if(globalThis.document?.visibilityState==='visible'&&this.#lastSynced!==null&&Date.now()-this.#lastSynced>=this.#retryMs*2&&!this.#running&&globalThis.navigator?.onLine!==false)this.#queueSync();else this.#schedule();};globalThis.document?.addEventListener?.('visibilitychange',this.#visibility);
     this.#schedule();
   }
   // Spread retries after rate limits. Successful idle mirrors poll less often,
@@ -38,6 +38,7 @@ export class MirroredFiles{
     const delay=Math.max(1,Math.round(base*(0.8+0.4*Math.random())));
     this.#timer=setTimeout(()=>{this.#timer=null;if(this.#closed)return;if(!this.#running&&globalThis.navigator?.onLine!==false)this.sync().catch(()=>{});else this.#schedule();},delay);
   }
+  #queueSync(){if(this.#closed)return;if(this.#running){this.sync().catch(()=>{});return;}if(this.#rateFailures&&this.#retryMs){if(!this.#timer)this.#schedule();return;}this.sync().catch(()=>{});}
   #check(){need(!this.#closed&&this.#valid(),'Account changed. Reopen your files.');}
   #changed(){for(const fn of this.#listeners)try{fn();}catch(e){console.error('File view update failed',e);}}
   subscribe(fn){this.#check();need(typeof fn==='function','Listener required.');this.#listeners.add(fn);return ()=>this.#listeners.delete(fn);}
@@ -75,16 +76,16 @@ export class MirroredFiles{
     const snapshot=incoming?await incoming.arrayBuffer():copy,sha256=await digest(snapshot),stored=new Blob([snapshot]);this.#check();
     const result=await this.#mutate(path,(old,all)=>{if(parent(path)!=='/'){const p=all.find(r=>r.path===parent(path));need(p&&!p.deleted&&p.directory,'Create the parent folder first.');}need(all.length<MAX_ENTRIES||old,'Browser file limit reached.');if(old?.moving)throw Error('Wait for this move to finish syncing.');if(expected===null?!!old:!old||old.deleted||old.directory||old.version!==expected)throw new MirrorConflict('This file changed; reload it before saving.');
       const row={scope:this.#scope,path,directory:false,data:stored,sha256,base:old?.base??null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:!!old?.conflict};return [row,{path,version:row.version,sha256,status:row.conflict?'conflict':'pending'}];});
-    this.#hasPending=true;this.#changed();this.sync().catch(()=>{});return result;
+    this.#hasPending=true;this.#changed();this.#queueSync();return result;
   }
-  async mkdir(path){path=filePath(path);need(path!=='/','Root already exists.');const result=await this.#mutate(path,(old,all)=>{if(parent(path)!=='/'){const p=all.find(r=>r.path===parent(path));need(p&&!p.deleted&&p.directory,'Create the parent folder first.');}need(all.length<MAX_ENTRIES,'Browser file limit reached.');if(old)throw new MirrorConflict('An item with that name already exists.');const row={scope:this.#scope,path,directory:true,data:null,sha256:null,base:null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:false};return [row,{path,version:row.version,status:'pending'}];});this.#hasPending=true;this.#changed();this.sync().catch(()=>{});return result;}
-  async remove(path,expected){path=filePath(path);need(path!=='/'&&typeof expected==='string','A saved version is required.');await this.#mutate(path,(old,all)=>{need(!all.some(r=>!r.deleted&&parent(r.path)===path),'Folder must be empty before deleting.');if(old?.moving)throw Error('Wait for this move to finish syncing.');if(!old||old.deleted||old.version!==expected)throw new MirrorConflict('This item changed; reload before deleting.');return [{...old,version:crypto.randomUUID(),dirty:true,deleted:true,conflict:!!old.conflict},true];});this.#hasPending=true;this.#changed();this.sync().catch(()=>{});}
+  async mkdir(path){path=filePath(path);need(path!=='/','Root already exists.');const result=await this.#mutate(path,(old,all)=>{if(parent(path)!=='/'){const p=all.find(r=>r.path===parent(path));need(p&&!p.deleted&&p.directory,'Create the parent folder first.');}need(all.length<MAX_ENTRIES,'Browser file limit reached.');if(old)throw new MirrorConflict('An item with that name already exists.');const row={scope:this.#scope,path,directory:true,data:null,sha256:null,base:null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:false};return [row,{path,version:row.version,status:'pending'}];});this.#hasPending=true;this.#changed();this.#queueSync();return result;}
+  async remove(path,expected){path=filePath(path);need(path!=='/'&&typeof expected==='string','A saved version is required.');await this.#mutate(path,(old,all)=>{need(!all.some(r=>!r.deleted&&parent(r.path)===path),'Folder must be empty before deleting.');if(old?.moving)throw Error('Wait for this move to finish syncing.');if(!old||old.deleted||old.version!==expected)throw new MirrorConflict('This item changed; reload before deleting.');return [{...old,version:crypto.randomUUID(),dirty:true,deleted:true,conflict:!!old.conflict},true];});this.#hasPending=true;this.#changed();this.#queueSync();}
   // Journal both sides atomically; server rename is version checked.
   async move(source,destination,expected){
     source=filePath(source);destination=filePath(destination);need(source!=='/'&&destination!=='/'&&source!==destination&&typeof expected==='string','Choose a different destination.');
     await this.#tx('readwrite',(store,done,fail)=>{const req=store.index('scope').getAll(this.#scope);req.onsuccess=()=>{try{this.#check();const all=req.result,old=all.find(r=>r.path===source);if(!old||old.deleted||old.directory||old.version!==expected)throw new MirrorConflict('This file changed; reload before moving.');need(!old.dirty&&!old.conflict&&!old.moving&&typeof old.base==='string','Wait for this file to finish syncing before moving it.');need(!all.some(r=>r.path===destination),'An item with that name already exists.');if(parent(destination)!=='/'){const dir=all.find(r=>r.path===parent(destination));need(dir&&!dir.deleted&&dir.directory&&!dir.moving&&!dir.dirty&&!dir.conflict,'Wait for the destination folder to finish syncing.');}
       store.put({...old,path:destination,base:null,version:crypto.randomUUID(),dirty:true,deleted:false,moving:true,moveFrom:source});store.put({...old,version:crypto.randomUUID(),dirty:true,deleted:true,moving:true,moveTo:destination});done(true);
-    }catch(e){fail(e);}};req.onerror=()=>fail(req.error);});this.#hasPending=true;this.#changed();this.sync().catch(()=>{});
+    }catch(e){fail(e);}};req.onerror=()=>fail(req.error);});this.#hasPending=true;this.#changed();this.#queueSync();
   }
   async #finishMove(source,destination,{restore=false,conflict=false}={}){
     return this.#tx('readwrite',(store,done,fail)=>{const req=store.index('scope').getAll(this.#scope);req.onsuccess=()=>{try{const all=req.result,a=all.find(r=>r.path===source.path),b=all.find(r=>r.path===destination.path);if(!a||!b||a.version!==source.version||b.version!==destination.version||a.moveTo!==b.path||b.moveFrom!==a.path)throw new MirrorConflict('Move changed in another tab.');if(restore){const {moving,moveTo,...prior}=a;store.put({...prior,deleted:false,dirty:conflict,conflict,version:crypto.randomUUID()});store.delete([this.#scope,b.path]);}else{const {moving,moveFrom,...next}=b;store.put({...next,base:source.base,dirty:false,conflict:false,version:crypto.randomUUID()});store.delete([this.#scope,a.path]);}done(true);}catch(e){fail(e);}};req.onerror=()=>fail(req.error);});
@@ -123,7 +124,13 @@ export class MirroredFiles{
     if(rows.some(r=>r.moving)){remote=await this.#remoteInventory();rows=await this.#all();}
     // Create parents before children; remove children before parents.
     const dirty=rows.filter(r=>r.dirty&&!r.conflict&&!r.moving).sort((a,b)=>(a.deleted?1:0)-(b.deleted?1:0)||(a.deleted?b.path.length-a.path.length:a.path.length-b.path.length));
-    for(const row of dirty){this.#check();const existing=remote.get(row.path),target=row.path.slice(1);
+    for(let index=0;index<dirty.length;index++){const row=dirty[index];this.#check();const existing=remote.get(row.path),target=row.path.slice(1);
+      // Updating existing files needs their server versions. Fetch a bounded
+      // group together; the eventual write/delete still enforces its base hash.
+      if(canBatch&&!row.directory&&existing&&!existing.directory&&!existing.sha256&&!batchCache.has(target)){
+        const paths=[];let length=0;for(let i=index;i<dirty.length&&paths.length<16;i++){const candidate=dirty[i],entry=remote.get(candidate.path),relative=candidate.path.slice(1),size=new TextEncoder().encode(relative).length;if(candidate.directory||!entry||entry.directory||entry.sha256||batchCache.has(relative))continue;if(length+size>8192)break;paths.push(relative);length+=size;}
+        if(paths.length){const values=await this.#server.versions(paths);this.#check();need(Array.isArray(values)&&values.length===paths.length,'Invalid batch file versions.');for(let i=0;i<paths.length;i++)batchCache.set(paths[i],values[i]);}
+      }
       if(row.directory){
         if(row.deleted){if(existing){if(!existing.directory||[...remote.keys()].some(p=>parent(p)===row.path)){await this.#conflict(row);continue;}await this.#server.remove(target,null);remote.delete(row.path);}await this.#ack(row,null,{remove:true});}
         else if(existing&&!existing.directory)await this.#conflict(row);
@@ -157,7 +164,7 @@ export class MirroredFiles{
     const inventory=await this.#remoteInventory(),entry=inventory.get(path);need(!entry?.directory,'The server has a folder at this path.');const remote=entry?await this.#server.read(path.slice(1)):null;this.#check();
     if(choice==='local'){await this.#update(path,current=>{if(!current||current.version!==expected)throw new MirrorConflict();return [{...current,base:remote?.sha256??null,conflict:false,dirty:true},true];});}
     else{await this.#update(path,current=>{if(!current||current.version!==expected)throw new MirrorConflict();if(!remote)return [null,true];return [{scope:this.#scope,path,directory:false,data:new Blob([remote.data]),sha256:remote.sha256,base:remote.sha256,version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false},true];});}
-    this.#changed();if(choice==='local'){this.#hasPending=true;this.sync().catch(()=>{});}
+    this.#changed();if(choice==='local'){this.#hasPending=true;this.#queueSync();}
   }
   async persistence(){return {supported:typeof navigator.storage?.persist==='function'&&typeof navigator.storage?.persisted==='function',persistent:typeof navigator.storage?.persisted==='function'&&await navigator.storage.persisted()===true};}
   async requestPersistence(){need(navigator.userActivation?.isActive,'Use the storage protection button.');need(typeof navigator.storage?.persist==='function','Storage protection is unavailable.');await navigator.storage.persist();return this.persistence();}
