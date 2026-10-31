@@ -44,7 +44,7 @@ class Transfer:
     deadline: int
 
 class Quotas:
-    def __init__(self, store, *, daily_bytes=512*1024*1024, shared_daily_bytes=2*1024*1024*1024,
+    def __init__(self, store, *, daily_bytes=50*1024**3, shared_daily_bytes=200*1024**3,
                  bytes_per_use=192*1024*1024, concurrent_uses=2, shared_concurrent_uses=4):
         self.store=store
         self.daily=integer(daily_bytes,1,1<<40);self.shared=integer(shared_daily_bytes,self.daily,1<<40)
