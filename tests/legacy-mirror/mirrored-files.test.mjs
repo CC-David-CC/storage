@@ -17,7 +17,7 @@ const pause=()=>new Promise(r=>setTimeout(r,0));
 const server=new Server(),a=new MirroredFiles({scope:'issuer:user-a',server,retryMs:0}),b=new MirroredFiles({scope:'issuer:user-b',server:new Server(),retryMs:0});
 assert.throws(()=>filePath('/../escape'));assert.throws(()=>filePath('/.secret'));
 server.offline=true;const first=await a.write('/note.txt','offline');await pause();assert.equal((await a.read('/note.txt')).status,'pending');assert.deepEqual((await b.list('/')).entries,[]);
-server.offline=false;await a.sync();assert.equal(new TextDecoder().decode((await server.read('note.txt')).data),'offline');assert.equal((await a.read('/note.txt')).status,'synced');
+server.offline=false;await a.sync();assert.equal(new TextDecoder().decode((await server.read('note.txt')).data),'offline');assert.equal((await a.read('/note.txt')).status,'synced');const noteInfo=await a.stat('/note.txt');assert.equal(noteInfo.bytes,7);assert.equal(noteInfo.status,'synced');assert.equal('data' in noteInfo,false);assert.equal(noteInfo.version,(await a.read('/note.txt')).version);
 // Blob input is snapshotted so a picker File cannot retain a disappearing disk source.
 const blobBytes=new Uint8Array([1,2,3,4]);const blob=new Blob([blobBytes]);blobBytes[0]=99;server.offline=true;await a.write('/blob.bin',blob);await pause();assert.deepEqual([...((await a.read('/blob.bin')).data)],[1,2,3,4]);server.offline=false;await a.sync();assert.deepEqual([...((await server.read('blob.bin')).data)],[1,2,3,4]);await assert.rejects(()=>a.write('/oversize.bin',new Blob([new Uint8Array(128*1024*1024+1)])),/128 MiB/);
 
