@@ -84,6 +84,15 @@ export class UserFiles{
   wordCount(path,previousSHA256){return this.request('word-count',{path,previousSHA256});}
   list(path=''){return this.request('list',{path});}
   mkdir(path){return this.request('mkdir',{path});}
+  async supportsInventoryVersions(){
+    this.check();const response=await fetch(this.base+'/inventory-versions-capabilities',{method:'GET',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:'no-referrer',signal:AbortSignal.timeout(10000)});this.check();if(response.status===404)return false;if(!response.ok)throw new FileRequestError('File inventory capabilities unavailable',response.status);
+    const text=await response.text();requireThat(text.length<=1024,'Invalid file inventory capabilities');let value;try{value=JSON.parse(text)}catch{throw Error('Invalid file inventory capabilities')};return !!(value&&Object.keys(value).length===5&&value.version==='codi-file-inventory-versions/1'&&value.maxDirectories===128&&value.maxEntries===2048&&value.maxHashedFiles===64&&value.maxHashBytes===32*1024*1024);
+  }
+  async inventoryVersions(){
+    const result=await this.request('inventory-versions');requireThat(result&&Object.keys(result).length===2&&typeof result.complete==='boolean'&&Array.isArray(result.entries)&&result.entries.length<=2048&&(result.complete||result.entries.length===0),'Invalid file inventory');let hashed=0,bytes=0;
+    for(const item of result.entries){requireThat(item&&typeof item.path==='string'&&item.path.length>0&&typeof item.directory==='boolean','Invalid file inventory entry');const keys=Object.keys(item).sort().join(',');if(keys==='directory,path')continue;requireThat(!item.directory&&keys==='bytes,directory,path,sha256'&&Number.isSafeInteger(item.bytes)&&item.bytes>=0&&item.bytes<=MAX_FILE&&typeof item.sha256==='string'&&/^[0-9a-f]{64}$/.test(item.sha256),'Invalid file inventory version');hashed++;bytes+=item.bytes;}
+    requireThat(hashed<=64&&bytes<=32*1024*1024,'File inventory version limit exceeded');return result;
+  }
   async supportsInventory(){
     this.check();const response=await fetch(this.base+'/inventory-capabilities',{method:'GET',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:'no-referrer',signal:AbortSignal.timeout(10000)});this.check();if(response.status===404)return false;if(!response.ok)throw new FileRequestError('File inventory capabilities unavailable',response.status);
     const text=await response.text();requireThat(text.length<=1024,'Invalid file inventory capabilities');let value;try{value=JSON.parse(text)}catch{throw Error('Invalid file inventory capabilities')};return !!(value&&Object.keys(value).length===3&&value.version==='codi-file-inventory/1'&&value.maxDirectories===128&&value.maxEntries===2048);

@@ -376,6 +376,30 @@ class UserStore:
                 if item['directory']:queue.append(path)
         return {'complete':True,'entries':result}
 
+    def inventory_versions(self, principal, *, maximum_total_bytes=32*1024*1024, maximum_files=64):
+        """Bounded tree and file hashes, with ordinary version fallback.
+
+        Never return partial trees. Reuse the normal list and read permissions,
+        no-follow descriptor checks and change-during-hash detection. Files
+        beyond the count or byte budget remain in the inventory without a hash.
+        """
+        maximum_total_bytes=integer(maximum_total_bytes,1,32*1024*1024)
+        maximum_files=integer(maximum_files,1,64)
+        with self.lock(),self.db() as db:
+            home=self._authorized(db,principal,'read');os.close(home)
+        result=self.inventory(principal)
+        if not result['complete']:return result
+        files=[entry for entry in result['entries'] if not entry['directory']][:maximum_files]
+        remaining=maximum_total_bytes
+        for offset in range(0,len(files),16):
+            if remaining<=0:break
+            group=files[offset:offset+16]
+            values=self.version_batch(principal,[entry['path'] for entry in group],maximum_total_bytes=remaining)
+            for entry,value in zip(group,values):
+                if value.get('deferred'):continue
+                entry.update(bytes=value['bytes'],sha256=value['sha256']);remaining-=value['bytes']
+        return result
+
     def _usage(self, *, clean_staging=False):
         total_size = total_entries = 0;users = {}
         for root in self.users_path.iterdir():
