@@ -20,7 +20,7 @@ const storedBytes=async value=>new Uint8Array(value instanceof Blob?await value.
 async function digest(value){return [...new Uint8Array(await crypto.subtle.digest('SHA-256',value))].map(b=>b.toString(16).padStart(2,'0')).join('');}
 export class MirrorConflict extends Error{constructor(message='This file changed on another device. Choose which copy to keep.'){super(message);this.name='MirrorConflict';}}
 export class MirroredFiles{
-  #scope;#server;#valid;#db;#opening;#running;#closed=false;#listeners=new Set();#timer;#online;#again=false;#lastError=null;#lastSynced=null;
+  #scope;#server;#valid;#db;#opening;#running;#closed=false;#listeners=new Set();#timer;#online;#again=false;#lastError=null;#lastSynced=null;#checked=new Map();
   constructor({scope,server,valid=()=>true,onChange=()=>{},retryMs=15000}={}){
     need(typeof scope==='string'&&scope.length>0&&scope.length<=512&&server&&typeof valid==='function'&&typeof onChange==='function','Authenticated file mirror required.');
     this.#scope=scope;this.#server=server;this.#valid=valid;this.#listeners.add(onChange);
@@ -122,10 +122,14 @@ export class MirroredFiles{
     for(const [path,item] of remote){this.#check();const row=local.get(path);if(row?.dirty)continue;
       if(item.directory){if(!row)await this.#install({path,version:null},{directory:true});else if(!row.directory)await this.#conflict({...row,dirty:true});continue;}
       if(row?.directory){await this.#conflict({...row,dirty:true});continue;}
-      let value;try{value=await version(path.slice(1),item);if(!row||row.sha256!==value.sha256){if(canVersion)value=await this.#server.read(path.slice(1));this.#check();await this.#install({path,version:row?.version??null},{directory:false,data:new Blob([value.data]),sha256:value.sha256});}}catch(error){issues.push('Could not sync '+path+': '+(error.message||'server file unavailable'));continue;}
+      // Keep verified progress only while a scan is incomplete. A local edit
+      // changes the row version and invalidates the entry. The next complete
+      // scan starts fresh, so external edits are still eventually discovered.
+      if(row&&this.#checked.get(path)===row.version)continue;
+      let value;try{value=await version(path.slice(1),item);if(!row||row.sha256!==value.sha256){if(canVersion)value=await this.#server.read(path.slice(1));this.#check();await this.#install({path,version:row?.version??null},{directory:false,data:new Blob([value.data]),sha256:value.sha256});}const current=await this.#get(path);if(current&&!current.dirty&&!current.directory&&current.sha256===value.sha256)this.#checked.set(path,current.version);}catch(error){if(error?.status===429)throw error;issues.push('Could not sync '+path+': '+(error.message||'server file unavailable'));continue;}
     }
     for(const row of fresh){if(row.dirty||remote.has(row.path))continue;if(row.directory&&fresh.some(child=>child.dirty&&child.path.startsWith(row.path+'/')))continue;await this.#update(row.path,current=>current&&!current.dirty&&current.version===row.version?[null,true]:[undefined,false]);}
-    this.#changed();if(issues.length)throw Error(issues[0]+(issues.length>1?' (and '+(issues.length-1)+' other files)':''));return {pending:(await this.#all()).filter(r=>r.dirty).length};
+    this.#changed();if(issues.length)throw Error(issues[0]+(issues.length>1?' (and '+(issues.length-1)+' other files)':''));this.#checked.clear();return {pending:(await this.#all()).filter(r=>r.dirty).length};
   }
   sync(){this.#check();if(this.#running){this.#again=true;return this.#running;}const run=async()=>{let result;do{this.#again=false;result=await this.#pass();}while(this.#again&&!this.#closed&&this.#valid());return result;};const task=(globalThis.navigator?.locks?.request?navigator.locks.request('codi-mirror:'+this.#scope,{mode:'exclusive'},run):run()).then(result=>{this.#lastError=null;this.#lastSynced=Date.now();this.#changed();return result;},error=>{if(!this.#closed){this.#lastError=error.message||'Server sync unavailable.';this.#changed();}throw error;}).finally(()=>{if(this.#running===task)this.#running=null;});this.#running=task;return task;}
   async resolve(path,choice,expected){path=filePath(path);need(['local','server'].includes(choice),'Choose which copy to keep.');const row=await this.#get(path);if(!row||!row.conflict||row.version!==expected)throw new MirrorConflict('This item changed; reload before resolving.');need(!row.directory,'Folder conflicts require manual resolution.');
@@ -136,5 +140,5 @@ export class MirroredFiles{
   }
   async persistence(){return {supported:typeof navigator.storage?.persist==='function'&&typeof navigator.storage?.persisted==='function',persistent:typeof navigator.storage?.persisted==='function'&&await navigator.storage.persisted()===true};}
   async requestPersistence(){need(navigator.userActivation?.isActive,'Use the storage protection button.');need(typeof navigator.storage?.persist==='function','Storage protection is unavailable.');await navigator.storage.persist();return this.persistence();}
-  close(){if(this.#closed)return;this.#closed=true;clearInterval(this.#timer);globalThis.removeEventListener?.('online',this.#online);this.#listeners.clear();this.#db?.close();this.#db=null;}
+  close(){if(this.#closed)return;this.#closed=true;clearInterval(this.#timer);globalThis.removeEventListener?.('online',this.#online);this.#listeners.clear();this.#checked.clear();this.#db?.close();this.#db=null;}
 }
