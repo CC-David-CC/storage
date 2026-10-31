@@ -12,3 +12,6 @@ existing files, gateways with batch version support check up to 16 versions per
 request; each write or deletion still checks its own expected server hash.
 The current issuer file-authorization limit is shared behind the reverse proxy;
 these client changes reduce load but do not establish 100-user capacity.
+
+`stat(path)` reports the local file version, hash, status and size without
+materializing its contents; applications may use it to detect changes.
