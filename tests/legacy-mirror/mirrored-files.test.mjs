@@ -50,4 +50,21 @@ const slow=new MirroredFiles({scope:'slow-scope',server:slowServer,retryMs:5});a
 // external changes are still detected by their server-side content hash.
 const versioned=new Server();let fullReads=0;const fullRead=versioned.read.bind(versioned);versioned.read=async path=>{fullReads++;return fullRead(path);};versioned.supportsVersion=async()=>true;versioned.version=async path=>{const r=versioned.files.get(path);if(!r||r.directory)throw Error('missing');return {bytes:r.data.length,sha256:await sha(r.data)};};
 const efficient=new MirroredFiles({scope:'versioned-scope',server:versioned,retryMs:0});await efficient.write('/changed.bin','first');await efficient.sync();await efficient.sync();assert.equal(fullReads,0,'Unchanged sync must not download file bytes');versioned.files.set('changed.bin',{directory:false,data:new TextEncoder().encode('other')});await efficient.sync();assert.equal(fullReads,1,'Changed server content must be downloaded');assert.equal(new TextDecoder().decode((await efficient.read('/changed.bin')).data),'other');efficient.close();
+// A limited service must not force a long scan to restart at its first file.
+const limited=new Server();for(let i=0;i<12;i++)limited.files.set('file'+String(i).padStart(2,'0')+'.txt',{directory:false,data:new TextEncoder().encode('old '+i)});
+limited.supportsVersion=async()=>true;let remaining=3,versionCalls=0;limited.version=async path=>{if(remaining--<=0)throw Object.assign(Error('slow down'),{status:429});versionCalls++;const r=limited.files.get(path);return {bytes:r.data.length,sha256:await sha(r.data)};};
+const resuming=new MirroredFiles({scope:'limited-scope',server:limited,retryMs:0});let completed=false;
+for(let i=0;i<6&&!completed;i++){remaining=3;try{await resuming.sync();completed=true;}catch(e){assert.equal(e.status,429);assert.equal((await resuming.status()).lastSynced,null);}}
+assert.equal(completed,true,'A scan larger than one request window must make progress');assert.equal(versionCalls,12);assert.equal((await resuming.list('/')).entries.length,12);
+limited.files.set('file00.txt',{directory:false,data:new TextEncoder().encode('new 0')});limited.files.set('file11.txt',{directory:false,data:new TextEncoder().encode('new 11')});completed=false;
+for(let i=0;i<6&&!completed;i++){remaining=3;try{await resuming.sync();completed=true;}catch(e){assert.equal(e.status,429);}}
+assert.equal(completed,true);assert.equal(new TextDecoder().decode((await resuming.read('/file00.txt')).data),'new 0');assert.equal(new TextDecoder().decode((await resuming.read('/file11.txt')).data),'new 11');
+// Successful completion clears the temporary progress so later external edits are discovered.
+limited.files.set('file00.txt',{directory:false,data:new TextEncoder().encode('newer')});completed=false;
+for(let i=0;i<6&&!completed;i++){remaining=3;try{await resuming.sync();completed=true;}catch(e){assert.equal(e.status,429);}}
+assert.equal(completed,true);assert.equal(new TextDecoder().decode((await resuming.read('/file00.txt')).data),'newer');
+// An edit during an interrupted scan still takes priority over cached checks.
+remaining=3;await assert.rejects(()=>resuming.sync(),e=>e.status===429);const edited=await resuming.read('/file00.txt');await resuming.write('/file00.txt','local during scan',edited.version);await pause();completed=false;
+for(let i=0;i<8&&!completed;i++){remaining=3;try{await resuming.sync();completed=true;}catch(e){assert.equal(e.status,429);}}
+assert.equal(completed,true);assert.equal(new TextDecoder().decode((await limited.read('file00.txt')).data),'local during scan');resuming.close();
 a.close();b.close();console.log('PASS offline local saves, account isolation, signed-server conflict safety, remote refresh, folders, deletion and lost reply recovery');
