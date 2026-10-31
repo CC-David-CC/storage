@@ -18,6 +18,9 @@ const server=new Server(),a=new MirroredFiles({scope:'issuer:user-a',server,retr
 assert.throws(()=>filePath('/../escape'));assert.throws(()=>filePath('/.secret'));
 server.offline=true;const first=await a.write('/note.txt','offline');await pause();assert.equal((await a.read('/note.txt')).status,'pending');assert.deepEqual((await b.list('/')).entries,[]);
 server.offline=false;await a.sync();assert.equal(new TextDecoder().decode((await server.read('note.txt')).data),'offline');assert.equal((await a.read('/note.txt')).status,'synced');
+// Blob input is immutable and is saved without an additional eager byte copy.
+const blobBytes=new Uint8Array([1,2,3,4]);const blob=new Blob([blobBytes]);blobBytes[0]=99;server.offline=true;await a.write('/blob.bin',blob);await pause();assert.deepEqual([...((await a.read('/blob.bin')).data)],[1,2,3,4]);server.offline=false;await a.sync();assert.deepEqual([...((await server.read('blob.bin')).data)],[1,2,3,4]);await assert.rejects(()=>a.write('/oversize.bin',new Blob([new Uint8Array(128*1024*1024+1)])),/128 MiB/);
+
 let local=await a.read('/note.txt');server.offline=true;await a.write('/note.txt','local edit',local.version);await pause();server.offline=false;server.files.set('note.txt',{directory:false,data:new TextEncoder().encode('other device')});await a.sync();local=await a.read('/note.txt');assert.equal(local.status,'conflict');assert.equal(new TextDecoder().decode(local.data),'local edit');assert.equal(new TextDecoder().decode((await server.read('note.txt')).data),'other device');
 await a.resolve('/note.txt','local',local.version);await a.sync();assert.equal(new TextDecoder().decode((await server.read('note.txt')).data),'local edit');
 server.files.set('note.txt',{directory:false,data:new TextEncoder().encode('remote refresh')});await a.sync();assert.equal(new TextDecoder().decode((await a.read('/note.txt')).data),'remote refresh');
