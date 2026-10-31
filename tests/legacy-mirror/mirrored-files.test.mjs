@@ -43,6 +43,14 @@ const tab=new MirroredFiles({scope:'issuer:user-a',server,retryMs:0});const befo
 const legacyBytes=new TextEncoder().encode('old local file'),legacyHash=await sha(legacyBytes);
 await new Promise((resolve,reject)=>{const open=indexedDB.open('codi-mirrored-files-v1',1);open.onerror=()=>reject(open.error);open.onsuccess=()=>{const db=open.result,tx=db.transaction('files','readwrite');tx.objectStore('files').put({scope:'legacy-scope',path:'/legacy.txt',directory:false,data:legacyBytes.buffer,sha256:legacyHash,base:null,version:'legacy-version',dirty:true,deleted:false,conflict:false});tx.oncomplete=()=>{db.close();resolve();};tx.onerror=()=>reject(tx.error);};});
 const legacy=new MirroredFiles({scope:'legacy-scope',server,retryMs:0});assert.equal(new TextDecoder().decode((await legacy.read('/legacy.txt')).data),'old local file');assert.equal((await legacy.list('/')).entries[0].bytes,legacyBytes.length);server.offline=false;await legacy.sync();assert.equal(new TextDecoder().decode((await server.read('legacy.txt')).data),'old local file');legacy.close();
+// Rate-limited automatic sync retries back off instead of hammering the shared
+// authority, retain the local write, and stop scheduling after close.
+const limitedAuto=new Server(),autoList=limitedAuto.list.bind(limitedAuto),rateTimes=[];
+limitedAuto.list=async path=>{rateTimes.push(Date.now());if(rateTimes.length<=3)throw Object.assign(Error('try later'),{status:429});return autoList(path)};
+const rateMirror=new MirroredFiles({scope:'automatic-rate-retry',server:limitedAuto,retryMs:20});await rateMirror.write('/pending.txt','kept locally');
+const rateEnd=Date.now()+2500;while(Date.now()<rateEnd&&!limitedAuto.files.has('pending.txt'))await new Promise(r=>setTimeout(r,5));
+assert.ok(limitedAuto.files.has('pending.txt'),'automatic retries eventually upload the saved local file');assert.equal(rateTimes.length,4);assert.ok(rateTimes[1]-rateTimes[0]>=25,'first rate-limit retry waits');assert.ok(rateTimes[2]-rateTimes[1]>=55,'second rate-limit retry waits longer');assert.ok(rateTimes[3]-rateTimes[2]>=110,'third rate-limit retry waits longer');
+rateMirror.close();await new Promise(r=>setTimeout(r,80));assert.equal(rateTimes.length,4,'closing stops retries');
 // A retry timer must not perpetually restart a slow in-flight sync.
 const slowServer=new Server();const realList=slowServer.list.bind(slowServer);slowServer.list=async path=>{await new Promise(r=>setTimeout(r,35));return realList(path);};
 const slow=new MirroredFiles({scope:'slow-scope',server:slowServer,retryMs:5});await Promise.race([slow.sync(),new Promise((_,reject)=>setTimeout(()=>reject(Error('Slow sync never settled')),500))]);slow.close();
