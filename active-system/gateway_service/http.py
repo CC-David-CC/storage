@@ -42,14 +42,16 @@ async def offload(function,*args,**kwargs):
         finally:raise
 
 class FileGateway:
-    def __init__(self, store, issuer_policy, *, base_path='', quotas=None, pacer=None, seconds_per_use=900, idle_seconds=5, upload_idle_seconds=60, max_requests_per_minute=256):
+    def __init__(self, store, issuer_policy, *, base_path='', quotas=None, pacer=None, seconds_per_use=900, idle_seconds=5, upload_idle_seconds=60, max_requests_per_minute=256, max_waiters=128, queue_seconds=5):
         self.store=store;self.gate=Gatekeeper(store,issuer_policy,base_path=base_path,clock=store.clock)
         self.host=urlsplit(self.gate.origin).netloc;self.quotas=quotas or Quotas(store);self.pacer=pacer or Pacer()
         if type(seconds_per_use) is not int or not 1<=seconds_per_use<=900 or not 0<idle_seconds<=10 or not 0<upload_idle_seconds<=120:
             raise ValueError('Bounded transfer lifetime and idle timeout required')
         if type(max_requests_per_minute) is not int or not 1<=max_requests_per_minute<=100000:raise ValueError('Bounded request limit required')
+        if type(max_waiters) is not int or not 1<=max_waiters<=256 or not isinstance(queue_seconds,(int,float)) or isinstance(queue_seconds,bool) or not 0<queue_seconds<=10:raise ValueError('Bounded request queue required')
         self.max_requests_per_minute=max_requests_per_minute
         self.seconds=seconds_per_use;self.idle=idle_seconds;self.upload_idle=upload_idle_seconds;self.active=0
+        self.slots=asyncio.Semaphore(4);self.waiting=0;self.max_waiters=max_waiters;self.queue_seconds=queue_seconds
         self.window=0;self.requests=0
         self.client_source=Path(__file__).with_name('client.mjs').read_bytes()
 
@@ -74,7 +76,19 @@ class FileGateway:
         now=int(time.monotonic())//60
         if now!=self.window:self.window=now;self.requests=0
         self.requests+=1
-        if self.requests>self.max_requests_per_minute or self.active>=4:raise web.HTTPTooManyRequests(text='Gateway request capacity reached')
+        if self.requests>self.max_requests_per_minute:raise web.HTTPTooManyRequests(text='Gateway request capacity reached')
+
+    async def _admit(self):
+        # Bound pending requests as well as active disk/crypto work. Awaiting a
+        # slot smooths short bursts without raising the four-operation limit.
+        if self.waiting>=self.max_waiters:raise web.HTTPTooManyRequests(text='Gateway request queue full')
+        self.waiting+=1
+        try:
+            try:
+                async with asyncio.timeout(self.queue_seconds):await self.slots.acquire()
+            except TimeoutError:raise web.HTTPTooManyRequests(text='Gateway request queue timed out') from None
+        finally:self.waiting-=1
+        self.active+=1
 
     async def _read(self, request, *, principal=None, deadline, length=None, idle=None):
         chunks=io.BytesIO();total=0
@@ -182,7 +196,8 @@ class FileGateway:
                 if request.raw_path=='/gateway/inventory-capabilities':return self._response({'version':'codi-file-inventory/1','maxDirectories':128,'maxEntries':2048})
                 if request.raw_path=='/gateway/upload-capabilities':return self._response({'version':'codi-binary-upload/1','maxBytes':MAX_FILE_BYTES})
                 return web.Response(body=self.client_source,content_type='text/javascript',headers={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'})
-            self._headers(request);self.active+=1;admitted=True
+            self._headers(request);await self._admit();admitted=True
+            if request.transport is None or request.transport.is_closing():raise web.HTTPRequestTimeout(text='Client disconnected while waiting')
             if request.path=='/gateway/challenge':
                 if request.content_length>16384:raise Denied('Bounded challenge required')
                 data=jose.loads(await self._read(request,deadline=time.monotonic()+self.idle))
@@ -259,6 +274,12 @@ class FileGateway:
             else:status,message=503,'File service unavailable'
             return self._response({'error':message},status)
         finally:
-            if read_fd is not None:os.close(read_fd)
-            if transfer:await offload(self.quotas.finish,transfer)
-            if admitted:self.active-=1
+            try:
+                try:
+                    if read_fd is not None:os.close(read_fd)
+                finally:
+                    if transfer:await offload(self.quotas.finish,transfer)
+            finally:
+                # A cleanup failure or repeated cancellation must never strand
+                # an admission slot and progressively stop the service.
+                if admitted:self.active-=1;self.slots.release()
