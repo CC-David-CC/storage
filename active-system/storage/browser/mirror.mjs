@@ -99,6 +99,31 @@ export class MirroredFiles{
     }catch(e){fail(e);}};req.onerror=()=>fail(req.error);});
     this.#hasPending=true;this.#changed();this.#queueSync();return result;
   }
+  // Import a prevalidated archive as one browser-storage transaction. Server
+  // synchronization remains per-entry and can be interrupted or conflict.
+  async importTree(root,entries,source,expected){
+    root=filePath(root);source=filePath(source);
+    need(root!=='/'&&source!=='/'&&typeof expected==='string'&&Array.isArray(entries)&&entries.length<MAX_ENTRIES,'Invalid archive import.');
+    const rows=[{path:root,directory:true,data:null,sha256:null}],seen=new Set([root]);let total=0;
+    for(const entry of entries){
+      need(entry&&typeof entry==='object'&&typeof entry.directory==='boolean','Invalid archive entry.');
+      const path=filePath(entry.path);need(path.startsWith(root+'/')&&!seen.has(path),'Duplicate or invalid archive path.');seen.add(path);
+      if(entry.directory)rows.push({path,directory:true,data:null,sha256:null});
+      else{const data=bytes(entry.data);need(data&&data.length<=MAX_FILE&&(total+=data.length)<=MAX_FILE,'Archive data exceeds 128 MiB.');const hash=await digest(data);this.#check();rows.push({path,directory:false,data:new Blob([data]),sha256:hash});}
+    }
+    const directories=new Set(rows.filter(r=>r.directory).map(r=>r.path));
+    for(const row of rows.slice(1))need(directories.has(parent(row.path)),'Archive is missing a parent folder.');
+    const result=await this.#tx('readwrite',(store,done,fail)=>{const req=store.index('scope').getAll(this.#scope);req.onsuccess=()=>{try{
+      this.#check();const all=req.result,original=all.find(r=>r.path===source);
+      if(!original||original.deleted||original.directory||original.version!==expected||original.conflict||original.moving)throw new MirrorConflict('The ZIP changed. Reload and try again.');
+      need(all.length+rows.length<=MAX_ENTRIES,'Browser file limit reached.');
+      const existing=new Set(all.map(r=>r.path));for(const row of rows)need(!existing.has(row.path),'An item with that name already exists.');
+      if(parent(root)!=='/'){const dir=all.find(r=>r.path===parent(root));need(dir&&!dir.deleted&&dir.directory&&!dir.conflict&&!dir.moving,'Choose an available destination folder.');}
+      for(const row of rows)store.put({scope:this.#scope,...row,base:null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:false});
+      done({path:root,entries:rows.length});
+    }catch(e){fail(e);}};req.onerror=()=>fail(req.error);});
+    this.#hasPending=true;this.#changed();this.#queueSync();return result;
+  }
   async remove(path,expected){path=filePath(path);need(path!=='/'&&typeof expected==='string','A saved version is required.');await this.#mutate(path,(old,all)=>{need(!all.some(r=>!r.deleted&&parent(r.path)===path),'Folder must be empty before deleting.');if(old?.moving)throw Error('Wait for this move to finish syncing.');if(!old||old.deleted||old.version!==expected)throw new MirrorConflict('This item changed; reload before deleting.');return [{...old,version:crypto.randomUUID(),dirty:true,deleted:true,conflict:!!old.conflict},true];});this.#hasPending=true;this.#changed();this.#queueSync();}
   // Journal both sides atomically; server rename is version checked.
   async move(source,destination,expected){
