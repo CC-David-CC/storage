@@ -16,6 +16,9 @@ TICKET_TYPE='codi-gateway-admission+jwt'
 PROOF_TYPE='codi-gateway-admission-proof+jws'
 _preverified=contextvars.ContextVar('codi_experimental_gateway_use',default=None)
 
+class StaleEpoch(Exception):
+    """A correctly signed enhanced proof names a previous gateway instance."""
+
 class Shares:
     """Separate bounded fixed-window counters; no account eviction within a window."""
     def __init__(self,*,verified=1536,legacy=256,invalid=256,per_account=240,max_accounts=4096,max_proofs=4096,clock=time.monotonic,wall=time.time):
@@ -94,7 +97,8 @@ class ExperimentalFileGateway(FileGateway):
         if not isinstance(c['cnf'],dict) or set(c['cnf'])!={'jwk'}:raise Denied('Invalid admission key')
         key=jose.public_jwk(jose.load_public(c['cnf']['jwk']));registered(Principal(c['sub'],c['sid'],'registered',key,c['exp']));digest(c['jti'])
         p=jose.verify(data['proof'],key,PROOF_TYPE,8192);window(p,now)
-        if set(p)!={'v','iss','aud','method','path','iat','exp','jti','ticket_sha256','request_sha256','epoch'} or type(p['v']) is not int or p['v']!=1 or p['iss']!=c['sid'] or p['aud']!=self.gate.audience or p['method']!='POST' or p['path']!=self.gate.use_path.removesuffix('/use')+'/challenge-v2' or p['ticket_sha256']!=jose.digest(data['ticket']) or p['request_sha256']!=request_sha or p['epoch']!=self.admission_epoch:raise Denied('Wrong admission proof context')
+        if set(p)!={'v','iss','aud','method','path','iat','exp','jti','ticket_sha256','request_sha256','epoch'} or type(p['v']) is not int or p['v']!=1 or p['iss']!=c['sid'] or p['aud']!=self.gate.audience or p['method']!='POST' or p['path']!=self.gate.use_path.removesuffix('/use')+'/challenge-v2' or p['ticket_sha256']!=jose.digest(data['ticket']) or p['request_sha256']!=request_sha:raise Denied('Wrong admission proof context')
+        if p['epoch']!=self.admission_epoch:raise StaleEpoch()
         digest(p['jti']);return c['sub'],key,request_sha,jose.digest(data['ticket'])+':'+p['jti'],min(c['exp'],p['exp'])
     async def handle(self,request):
         if request.raw_path=='/gateway/admission-capabilities' and request.method=='GET':
@@ -109,6 +113,7 @@ class ExperimentalFileGateway(FileGateway):
             if request.raw_path=='/gateway/challenge-v2':
                 if request.content_length>16384:self.shares.take('invalid');raise Denied('Bounded challenge required')
                 try:subject,key,request_sha,proof_id,expires=await self._ticket_request(request)
+                except StaleEpoch:self.shares.take('invalid');return self._response({'error':'Gateway instance changed','code':'stale_epoch'},409)
                 except (ValueError,TypeError,KeyError):self.shares.take('invalid');raise web.HTTPUnauthorized(text='Invalid admission ticket or proof') from None
                 self.shares.take('verified',subject,proof_id,expires)
                 await self._admit()
