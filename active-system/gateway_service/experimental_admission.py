@@ -46,13 +46,15 @@ class Shares:
             self.counts[kind]=self.counts.get(kind,0)+1
 
 class ExperimentalFileGateway(FileGateway):
-    def __init__(self,*args,shares=None,verification_slots=2,verification_waiters=32,**kwargs):
+    def __init__(self,*args,shares=None,verification_slots=2,verification_waiters=32,challenge_read_slots=2,challenge_read_waiters=32,**kwargs):
         super().__init__(*args,**kwargs)
         # Never persist or share this process instance's epoch. A proof signed
         # for an earlier process cannot be reused after a restart.
         self.admission_epoch=secrets.token_urlsafe(32)
         if type(verification_slots) is not int or not 1<=verification_slots<=4 or type(verification_waiters) is not int or not 1<=verification_waiters<=128:raise ValueError('Bounded verification queue required')
+        if type(challenge_read_slots) is not int or not 1<=challenge_read_slots<=4 or type(challenge_read_waiters) is not int or not 1<=challenge_read_waiters<=128:raise ValueError('Bounded challenge body queue required')
         self.shares=shares or Shares();self.verification_slots=asyncio.Semaphore(verification_slots);self.verification_waiters=verification_waiters;self.verification_waiting=0
+        self.challenge_read_slots=asyncio.Semaphore(challenge_read_slots);self.challenge_read_waiters=challenge_read_waiters;self.challenge_read_waiting=0
         if sum(self.shares.limits.values())>self.max_requests_per_minute:raise ValueError('Admission shares exceed shared limit')
         self._real_begin=self.gate.begin
         def already_verified(confirmation,proof,*,seconds=900):
@@ -83,11 +85,22 @@ class ExperimentalFileGateway(FileGateway):
         try:return await offload(fn,*args)
         finally:self.verification_slots.release()
     async def _ticket_request(self,request):
-        await self._acquire_verification()
+        # A slow unauthenticated body must not hold a cryptographic slot needed
+        # by an already-signed file use. Body readers and waiters remain bounded.
+        if self.challenge_read_waiting>=self.challenge_read_waiters:raise web.HTTPTooManyRequests(text='Gateway challenge body queue full')
+        self.challenge_read_waiting+=1
         try:
-            data=jose.loads(await self._read(request,deadline=time.monotonic()+self.idle))
-            return await offload(self._ticket,data)
-        finally:self.verification_slots.release()
+            try:
+                async with asyncio.timeout(5):await self.challenge_read_slots.acquire()
+            except TimeoutError:raise web.HTTPTooManyRequests(text='Gateway challenge body queue timed out') from None
+        finally:self.challenge_read_waiting-=1
+        try:
+            try:raw=await self._read(request,deadline=time.monotonic()+self.idle)
+            except TimeoutError:raise web.HTTPRequestTimeout(text='Gateway challenge body timed out') from None
+        finally:self.challenge_read_slots.release()
+        # JSON parsing is also untrusted work and stays inside the verification
+        # bound. The body never exceeds the endpoint's 16 KiB limit.
+        return await self._verify_slot(lambda:self._ticket(jose.loads(raw)))
     def _ticket(self,data):
         if not isinstance(data,dict) or set(data)!={'ticket','proof','request_sha256'}:raise Denied('Invalid admission envelope')
         request_sha=digest(data['request_sha256']);header,_,_,_=jose.inspect(data['ticket'],TICKET_TYPE,8192);authority=self.gate.keys.get(header.get('kid'))
