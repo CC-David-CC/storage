@@ -7,6 +7,12 @@ its files are stored at:
 
     <configured-data-root>/users/<account-UUID-without-dashes>/
 
+My files presents that account folder as `/`; it is not the server's system
+root or the temporary Linux guest filesystem. New accounts receive Documents,
+Digital Projects, 3D Objects, Games, Pictures, Audio and Video as ordinary
+private folders. Users may rename or delete them; they are seeded only while a
+new account's home is initialized and are not recreated on later sign-ins.
+
 For example, the empty `data/` directory beside this note is a possible **local
 example**, and `state/` is a separate possible location for the permissions
 SQLite database. They are not configured or serving files automatically; the local preview launcher explicitly uses them. Both

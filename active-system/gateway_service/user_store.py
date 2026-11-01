@@ -22,6 +22,7 @@ import uuid
 from .policy import Denied, Principal, integer, parts
 
 OPERATIONS = ('list', 'read', 'create', 'replace', 'mkdir', 'delete', 'rename')
+DEFAULT_ACCOUNT_FOLDERS = ('Documents', 'Digital Projects', '3D Objects', 'Games', 'Pictures', 'Audio', 'Video')
 class Conflict(Denied):
     """The caller's file version or create precondition no longer holds."""
 SCHEMA = [
@@ -56,7 +57,8 @@ def private_directory(path):
 class UserStore:
     def __init__(self, state_root, data_root, *, clock=time.time,
                  per_user_bytes=1024*1024*1024, per_user_entries=1024,
-                 total_bytes=10*1024*1024*1024, total_entries=100000, maximum_users=1024):
+                 total_bytes=10*1024*1024*1024, total_entries=100000, maximum_users=1024,
+                 initial_folders=()):
         self.state_root = private_directory(state_root)
         self.data_root = private_directory(data_root)
         if self.state_root.is_relative_to(self.data_root) or self.data_root.is_relative_to(self.state_root):
@@ -67,6 +69,12 @@ class UserStore:
         self.total_bytes = integer(total_bytes, self.per_user_bytes, 1 << 40)
         self.total_entries = integer(total_entries, self.per_user_entries, 1000000)
         self.maximum_users = integer(maximum_users, 1, 100000)
+        if not isinstance(initial_folders, tuple) or len(set(initial_folders)) != len(initial_folders):
+            raise ValueError('Invalid initial folders')
+        for name in initial_folders:
+            if not isinstance(name, str) or parts(name) != (name,):raise ValueError('Invalid initial folder name')
+        if len(initial_folders) > self.per_user_entries:raise ValueError('Initial folders exceed the account entry limit')
+        self.initial_folders = initial_folders
         self.database = self.state_root / 'permissions.sqlite3'
         self.lock_path = self.state_root / '.storage.lock'
         self.users_path = self.data_root / 'users'
@@ -183,9 +191,22 @@ class UserStore:
                     pass
                 private_directory(folder)
                 self._sync_directory(self.users_path)
-                if any(folder.iterdir()):
-                    raise ValueError('Uncommitted home contains data; retain for recovery')
+                # Pending homes may contain only our empty, private starter
+                # directories after an interrupted initialization. Never adopt
+                # unexpected data or recreate folders after the account is ready.
+                for entry in folder.iterdir():
+                    if entry.name not in self.initial_folders:
+                        raise ValueError('Uncommitted home contains data; retain for recovery')
+                    private_directory(entry)
+                    if any(entry.iterdir()):raise ValueError('Uncommitted home contains data; retain for recovery')
                 phase('directory-created')
+                _, _, entries = self._usage(clean_staging=True)
+                missing = [name for name in self.initial_folders if not (folder/name).exists()]
+                if entries + len(missing) > self.total_entries:raise Denied('Storage entry quota exceeded')
+                for name in missing:
+                    (folder/name).mkdir(mode=0o700)
+                    self._sync_directory(folder)
+                    phase('starter-folder-created')
                 db.execute('BEGIN IMMEDIATE')
                 for operation in OPERATIONS:
                     db.execute('INSERT INTO permissions VALUES(?,?,?,1)', (principal.sub, 'my-files', operation))
