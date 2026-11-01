@@ -82,6 +82,22 @@ export class MirroredFiles{
     this.#hasPending=true;this.#changed();this.#queueSync();return result;
   }
   async mkdir(path){path=filePath(path);need(path!=='/','Root already exists.');const result=await this.#mutate(path,(old,all)=>{if(parent(path)!=='/'){const p=all.find(r=>r.path===parent(path));need(p&&!p.deleted&&p.directory,'Create the parent folder first.');}need(all.length<MAX_ENTRIES,'Browser file limit reached.');if(old)throw new MirrorConflict('An item with that name already exists.');const row={scope:this.#scope,path,directory:true,data:null,sha256:null,base:null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:false};return [row,{path,version:row.version,status:'pending'}];});this.#hasPending=true;this.#changed();this.#queueSync();return result;}
+  // The source version and new destination are checked in the same browser
+  // transaction. This is a local snapshot, not a server-side copy operation.
+  async copyFile(source,destination,expected){
+    source=filePath(source);destination=filePath(destination);
+    need(source!=='/'&&destination!=='/'&&source!==destination&&typeof expected==='string','Choose a different destination for the copy.');
+    const result=await this.#mutate(destination,(old,all)=>{
+      const original=all.find(row=>row.path===source);
+      if(!original||original.deleted||original.directory||original.version!==expected)throw new MirrorConflict('The source file changed; reload before copying.');
+      need(!original.conflict&&!original.moving,'Resolve conflicts and finish moves before copying.');
+      need(!old,'An item with that name already exists.');need(all.length<MAX_ENTRIES,'Browser file limit reached.');
+      if(parent(destination)!=='/'){const dir=all.find(row=>row.path===parent(destination));need(dir&&!dir.deleted&&dir.directory&&!dir.conflict&&!dir.moving,'Choose an available destination folder.');}
+      const row={scope:this.#scope,path:destination,directory:false,data:original.data,sha256:original.sha256,base:null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:false};
+      return [row,{path:destination,version:row.version,sha256:row.sha256,status:'pending'}];
+    });
+    this.#hasPending=true;this.#changed();this.#queueSync();return result;
+  }
   // Copy a consistent local snapshot in one transaction. The usual mirror
   // queue then synchronizes its entries; server synchronization is not atomic.
   async copyTree(source,destination,expected){
