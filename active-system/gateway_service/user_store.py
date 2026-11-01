@@ -6,6 +6,7 @@ anonymous path can allocate a user row or folder. Files are not a public web tre
 """
 from contextlib import contextmanager
 import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -663,9 +664,30 @@ class UserStore:
                     raise Conflict('Operation identifier was used for a different folder move')
                 if row and row[5] == 'done':
                     return {'operationId': operation_id, 'state': 'done'}
+                def overlaps(a,b):return a[:len(b)]==b or b[:len(a)]==a
+                prepared=db.execute("SELECT operation_id,source,destination FROM folder_move_receipts WHERE subject=? AND state='prepared'",(principal.sub,)).fetchall()
+                if any(other!=operation_id and any(overlaps(path,parts(location)) for path in (src,dst) for location in (old_source,old_destination)) for other,old_source,old_destination in prepared):
+                    raise Conflict('A prepared folder move overlaps this move; complete recovery first')
+                has_cleanup = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='folder_orphan_cleanups'").fetchone()
+                if has_cleanup:
+                    pending_paths=db.execute("SELECT path FROM folder_orphan_cleanups WHERE subject=? AND state='pending'",(principal.sub,)).fetchall()
+                    if any(overlaps(src,parts(path)) or overlaps(dst,parts(path)) for (path,) in pending_paths):
+                        raise Conflict('Folder marker cleanup overlaps this move; complete recovery first')
+                marker_name = 'user.codiserver.folder_move'
+                def require_unmarked_ancestors(names):
+                    fd=os.dup(home)
+                    try:
+                        for component in names[:-1]:
+                            following=os.open(component,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=fd)
+                            os.close(fd);fd=following
+                            try:os.getxattr(fd,marker_name)
+                            except OSError as error:
+                                if error.errno!=errno.ENODATA:raise
+                            else:raise Conflict('An ancestor folder has an unresolved move marker')
+                    finally:os.close(fd)
+                require_unmarked_ancestors(src);require_unmarked_ancestors(dst)
                 src_parent, src_name = self._parent(home, source)
                 dst_parent, dst_name = self._parent(home, destination)
-                marker_name = 'user.codiserver.folder_move'
                 def marker_matches(fd, expected):
                     try: return os.getxattr(fd, marker_name).hex() == expected
                     except OSError: return False
@@ -681,6 +703,18 @@ class UserStore:
                     for entry in entries:
                         destination_path = '/'.join(dst) + '/' + entry['path']
                         if len(parts(destination_path)) > 16: raise Denied('Moved folder exceeds path depth limit')
+                        if entry['directory']:
+                            child_parent = child = None
+                            try:
+                                child_parent,child_name=self._parent(fd,entry['path'])
+                                child=os.open(child_name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=child_parent)
+                                try: os.getxattr(child,marker_name)
+                                except OSError as error:
+                                    if error.errno!=errno.ENODATA:raise
+                                else: raise Conflict('A descendant folder has an unresolved move marker')
+                            finally:
+                                if child is not None:os.close(child)
+                                if child_parent is not None:os.close(child_parent)
                     return digest == manifest_sha256
                 src_info, dst_info = info(src_parent, src_name), info(dst_parent, dst_name)
                 if row:
@@ -743,6 +777,99 @@ class UserStore:
             finally:
                 for descriptor in (tree, src_parent, dst_parent, read_home, list_home, home):
                     if descriptor is not None: os.close(descriptor)
+
+    def inspect_orphan_folder_marker(self, principal, path):
+        """Inspect one marker for local operator review; never routed to browsers.
+
+        A marker without a receipt may be an unrelated pre-existing xattr. This
+        method does not assert ownership or change the folder.
+        """
+        from .folder_manifest import folder_manifest
+        marker_name = 'user.codiserver.folder_move'
+        with self.lock(), self.db() as db:
+            home = self._authorized(db,principal,'rename');read_home=list_home=parent=tree=None
+            try:
+                read_home=self._authorized(db,principal,'read');list_home=self._authorized(db,principal,'list')
+                parent,name=self._parent(home,path)
+                tree=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent)
+                info=os.fstat(tree);digest=folder_manifest(tree)[1]
+                try: marker=os.getxattr(tree,marker_name).hex();present=True
+                except OSError as error:
+                    if error.errno!=errno.ENODATA: raise
+                    marker=None;present=False
+                cleanups=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='folder_orphan_cleanups'").fetchone()
+                pending=[]
+                if cleanups:
+                    pending=db.execute("SELECT marker,manifest_sha256 FROM folder_orphan_cleanups WHERE subject=? AND path=? AND device=? AND inode=? AND state='pending'",(principal.sub,path,str(info.st_dev),str(info.st_ino))).fetchall()
+                if len(pending)>1:raise Conflict('Multiple unfinished marker cleanups require review')
+                if not present and pending:marker=pending[0][0]
+                if marker is None:return {'path':path,'marker':None,'device':str(info.st_dev),'inode':str(info.st_ino),'sha256':digest,'present':False,'receipt':False,'cleanup':'none'}
+                receipts=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='folder_move_receipts'").fetchone()
+                receipt=bool(receipts and db.execute('SELECT 1 FROM folder_move_receipts WHERE marker=? LIMIT 1',(marker,)).fetchone())
+                cleanup='pending' if pending and pending[0][0]==marker else 'none'
+                return {'path':path,'marker':marker,'device':str(info.st_dev),'inode':str(info.st_ino),'sha256':digest,'present':present,'receipt':receipt,'cleanup':cleanup}
+            finally:
+                for fd in (tree,parent,list_home,read_home,home):
+                    if fd is not None:os.close(fd)
+
+    def clear_orphan_folder_marker(self, principal, inspection, *, operator_confirmed=False, phase=lambda name: None):
+        """Remove an inspected *unreceipted* marker after explicit local review.
+
+        This method has no HTTP route. The operator must establish marker
+        ownership independently; a random-looking orphan xattr is not proof it
+        belongs to the service. A durable cleanup intent makes a retry after
+        process death safe and blocks new folder moves until cleanup finishes.
+        """
+        from .folder_manifest import folder_manifest
+        fields={'path','marker','device','inode','sha256','present','receipt','cleanup'}
+        if operator_confirmed is not True or not isinstance(inspection,dict) or set(inspection)!=fields:
+            raise Denied('Explicit local operator review and exact inspection required')
+        path=inspection['path'];marker=inspection['marker'];device=inspection['device'];inode=inspection['inode'];digest=inspection['sha256']
+        if not isinstance(marker,str) or not re.fullmatch(r'[0-9a-f]{64}',marker) or not isinstance(device,str) or not device.isdecimal() or not isinstance(inode,str) or not inode.isdecimal() or not isinstance(digest,str) or not re.fullmatch(r'[0-9a-f]{64}',digest):
+            raise Denied('Invalid inspected marker identity')
+        if inspection['receipt'] is not False or type(inspection['present']) is not bool or inspection['cleanup'] not in ('none','pending'):
+            raise Denied('Marker is not an inspected orphan')
+        marker_name='user.codiserver.folder_move'
+        with self.lock(), self.db() as db:
+            home=self._authorized(db,principal,'rename');read_home=list_home=parent=tree=None
+            try:
+                read_home=self._authorized(db,principal,'read');list_home=self._authorized(db,principal,'list')
+                parent,name=self._parent(home,path);tree=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent)
+                info=os.fstat(tree)
+                if (str(info.st_dev),str(info.st_ino))!=(device,inode) or folder_manifest(tree)[1]!=digest:raise Conflict('Folder changed after inspection; inspect it again')
+                receipts=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='folder_move_receipts'").fetchone()
+                if receipts and db.execute('SELECT 1 FROM folder_move_receipts WHERE marker=? LIMIT 1',(marker,)).fetchone():raise Conflict('Marker has a move receipt; do not remove it as an orphan')
+                if receipts:
+                    location=parts(path)
+                    def overlaps(a,b):return a[:len(b)]==b or b[:len(a)]==a
+                    pending=db.execute("SELECT source,destination FROM folder_move_receipts WHERE subject=? AND state='prepared'",(principal.sub,)).fetchall()
+                    if any(overlaps(location,parts(source)) or overlaps(location,parts(destination)) for source,destination in pending):raise Conflict('A prepared folder move overlaps this marker; review it first')
+                db.execute('PRAGMA synchronous=FULL')
+                db.execute("CREATE TABLE IF NOT EXISTS folder_orphan_cleanups (subject TEXT NOT NULL, marker TEXT NOT NULL, path TEXT NOT NULL, device TEXT NOT NULL, inode TEXT NOT NULL, manifest_sha256 TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','done')), PRIMARY KEY(subject,marker))")
+                prior=db.execute('SELECT path,device,inode,manifest_sha256,state FROM folder_orphan_cleanups WHERE subject=? AND marker=?',(principal.sub,marker)).fetchone()
+                if prior and prior[:4]!=(path,device,inode,digest):raise Conflict('Cleanup identifier belongs to a different folder inspection')
+                if prior and prior[4]=='done':return {'state':'done'}
+                try: current=os.getxattr(tree,marker_name).hex()
+                except OSError as error:
+                    if error.errno!=errno.ENODATA:raise
+                    current=None
+                if current is not None and current!=marker:raise Conflict('Folder marker changed after inspection')
+                if current is None and not prior:raise Conflict('Folder marker is missing; no cleanup intent exists')
+                if not prior and (inspection['present'] is not True or inspection['cleanup']!='none'):raise Conflict('Fresh cleanup requires a current marker inspection')
+                if not prior:
+                    if db.execute('SELECT count(*) FROM folder_orphan_cleanups WHERE subject=?',(principal.sub,)).fetchone()[0]>=10000:raise Denied('Folder marker cleanup receipt limit reached')
+                    db.execute('BEGIN IMMEDIATE');db.execute("INSERT INTO folder_orphan_cleanups VALUES(?,?,?,?,?,?,'pending')",(principal.sub,marker,path,device,inode,digest));db.commit();phase('cleanup-prepared')
+                still_named=os.stat(name,dir_fd=parent,follow_symlinks=False)
+                if (str(still_named.st_dev),str(still_named.st_ino))!=(device,inode) or folder_manifest(tree)[1]!=digest:raise Conflict('Folder changed during marker cleanup; stop and review')
+                if current is not None:
+                    if os.getxattr(tree,marker_name).hex()!=marker:raise Conflict('Folder marker changed during cleanup; stop and review')
+                    os.removexattr(tree,marker_name)
+                phase('cleanup-removed');os.fsync(tree)
+                db.execute('BEGIN IMMEDIATE');db.execute("UPDATE folder_orphan_cleanups SET state='done' WHERE subject=? AND marker=? AND state='pending'",(principal.sub,marker));db.commit()
+                return {'state':'done'}
+            finally:
+                for fd in (tree,parent,list_home,read_home,home):
+                    if fd is not None:os.close(fd)
 
     def set_permission(self, subject, operation, allowed):
         if operation not in OPERATIONS or type(allowed) is not bool:

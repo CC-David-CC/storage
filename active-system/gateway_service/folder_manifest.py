@@ -12,7 +12,8 @@ import stat
 from .policy import Denied, parts
 
 MAX_ENTRIES = 4096
-MAX_BYTES = 128 * 1024 * 1024
+MAX_BYTES = 128 * 1024 * 1024  # Per file, matching the gateway limit.
+MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024  # Bound lock-held hashing work.
 MAX_DEPTH = 16
 
 
@@ -67,9 +68,11 @@ def folder_manifest(root_fd):
                                 raise Denied('Folder file changed or is not private')
                             if stat.S_IMODE(before.st_mode) != 0o600:
                                 raise Denied('Private owned file required')
+                            if before.st_size > MAX_BYTES:
+                                raise Denied('Folder file size limit exceeded')
                             total += before.st_size
-                            if total > MAX_BYTES:
-                                raise Denied('Folder manifest byte limit exceeded')
+                            if total > MAX_TOTAL_BYTES:
+                                raise Denied('Folder manifest total byte limit exceeded')
                             digest = hashlib.sha256(); read = 0
                             while chunk := os.read(child, 65536):
                                 read += len(chunk)
