@@ -615,6 +615,135 @@ class UserStore:
                     if descriptor is not None:
                         os.close(descriptor)
 
+    def folder_manifest(self, principal, path):
+        """Return a bounded content manifest; no folder-move endpoint is exposed."""
+        from .folder_manifest import folder_manifest
+        with self.lock(), self.db() as db:
+            home = self._authorized(db, principal, 'list')
+            parent = fd = read_home = None
+            try:
+                read_home = self._authorized(db, principal, 'read')
+                parent, name = self._parent(home, path)
+                fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+                entries, digest = folder_manifest(fd)
+                return {'entries': entries, 'sha256': digest}
+            finally:
+                for descriptor in (fd, parent, read_home, home):
+                    if descriptor is not None: os.close(descriptor)
+
+    def move_folder(self, principal, source, destination, *, manifest_sha256, operation_id, phase=lambda name: None):
+        """No-replace folder move with a durable, account-scoped retry receipt.
+
+        Gateway-controlled mutations are serialized by the storage lock. Host
+        processes writing directly to the disk do not honor this lock; they must
+        be quiesced during this operation. Ambiguous recovery is never repaired
+        by deleting or replacing either path. This primitive is not yet routed.
+        """
+        from .folder_manifest import folder_manifest
+        src, dst = parts(source), parts(destination)
+        if not src or not dst or len(src) > 16 or len(dst) > 16 or src == dst or dst[:len(src)] == src:
+            raise Denied('Choose a different destination outside the folder')
+        if not isinstance(manifest_sha256, str) or not re.fullmatch(r'[0-9a-f]{64}', manifest_sha256):
+            raise Denied('Exact folder manifest hash required')
+        try:
+            if not isinstance(operation_id, str) or str(uuid.UUID(operation_id)) != operation_id:
+                raise ValueError()
+        except (ValueError, AttributeError):
+            raise Denied('Canonical operation identifier required') from None
+        with self.lock(), self.db() as db:
+            home = self._authorized(db, principal, 'rename')
+            src_parent = dst_parent = read_home = list_home = tree = None
+            try:
+                read_home = self._authorized(db, principal, 'read')
+                list_home = self._authorized(db, principal, 'list')
+                db.execute('PRAGMA synchronous=FULL')
+                db.execute("CREATE TABLE IF NOT EXISTS folder_move_receipts (subject TEXT NOT NULL, operation_id TEXT NOT NULL, source TEXT NOT NULL, destination TEXT NOT NULL, manifest_sha256 TEXT NOT NULL, device TEXT NOT NULL, inode TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','done')), marker TEXT NOT NULL, PRIMARY KEY(subject,operation_id))")
+                row = db.execute('SELECT source,destination,manifest_sha256,device,inode,state,marker FROM folder_move_receipts WHERE subject=? AND operation_id=?', (principal.sub, operation_id)).fetchone()
+                if row and row[:3] != (source, destination, manifest_sha256):
+                    raise Conflict('Operation identifier was used for a different folder move')
+                if row and row[5] == 'done':
+                    return {'operationId': operation_id, 'state': 'done'}
+                src_parent, src_name = self._parent(home, source)
+                dst_parent, dst_name = self._parent(home, destination)
+                marker_name = 'user.codiserver.folder_move'
+                def marker_matches(fd, expected):
+                    try: return os.getxattr(fd, marker_name).hex() == expected
+                    except OSError: return False
+                def clean_marker(fd, expected):
+                    try:
+                        if marker_matches(fd, expected): os.removexattr(fd, marker_name);os.fsync(fd)
+                    except OSError: pass
+                def info(parent_fd, name):
+                    try: return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    except FileNotFoundError: return None
+                def matches_manifest(fd):
+                    entries, digest = folder_manifest(fd)
+                    for entry in entries:
+                        destination_path = '/'.join(dst) + '/' + entry['path']
+                        if len(parts(destination_path)) > 16: raise Denied('Moved folder exceeds path depth limit')
+                    return digest == manifest_sha256
+                src_info, dst_info = info(src_parent, src_name), info(dst_parent, dst_name)
+                if row:
+                    device, inode = row[3:5]
+                    identity = lambda item: item is not None and stat.S_ISDIR(item.st_mode) and str(item.st_dev) == device and str(item.st_ino) == inode
+                    if src_info is None and identity(dst_info):
+                        tree = os.open(dst_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dst_parent)
+                        if not marker_matches(tree,row[6]) or not matches_manifest(tree): raise Conflict('Folder move recovery is ambiguous; retain both paths for review')
+                        os.fsync(src_parent);os.fsync(dst_parent)
+                        db.execute('BEGIN IMMEDIATE');db.execute("UPDATE folder_move_receipts SET state='done' WHERE subject=? AND operation_id=? AND state='prepared'", (principal.sub,operation_id));db.commit();phase('committed')
+                        clean_marker(tree,row[6])
+                        return {'operationId': operation_id, 'state': 'done'}
+                    if not identity(src_info) or dst_info is not None:
+                        raise Conflict('Folder move recovery is ambiguous; retain both paths for review')
+                else:
+                    if src_info is None or not stat.S_ISDIR(src_info.st_mode): raise Denied('Source folder required')
+                    if dst_info is not None: raise Conflict('Destination already exists')
+                tree = os.open(src_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=src_parent)
+                tree_info = os.fstat(tree)
+                if not src_info or (tree_info.st_dev,tree_info.st_ino) != (src_info.st_dev,src_info.st_ino): raise Conflict('Source folder changed')
+                if not matches_manifest(tree): raise Conflict('Folder changed; refresh its manifest before moving')
+                if row and not marker_matches(tree,row[6]): raise Conflict('Folder move recovery is ambiguous; retain both paths for review')
+                if not row:
+                    # A crash after committing a completed receipt may leave its
+                    # marker behind. Remove only a matching, completed receipt.
+                    try: old_marker = os.getxattr(tree,marker_name).hex()
+                    except OSError: old_marker = None
+                    if old_marker is not None:
+                        prior = db.execute("SELECT destination,device,inode,state FROM folder_move_receipts WHERE subject=? AND marker=?",(principal.sub,old_marker)).fetchone()
+                        if not prior or prior != (source,str(tree_info.st_dev),str(tree_info.st_ino),'done'): raise Conflict('Folder has an unresolved move marker')
+                        clean_marker(tree,old_marker)
+                    count = db.execute('SELECT count(*) FROM folder_move_receipts WHERE subject=?', (principal.sub,)).fetchone()[0]
+                    if count >= 10000: raise Denied('Folder move receipt limit reached')
+                    marker = secrets.token_hex(32)
+                    os.setxattr(tree,marker_name,bytes.fromhex(marker),flags=os.XATTR_CREATE);os.fsync(tree)
+                    phase('marked')
+                    try:
+                        db.execute('BEGIN IMMEDIATE')
+                        db.execute("INSERT INTO folder_move_receipts VALUES(?,?,?,?,?,?,?,'prepared',?)", (principal.sub,operation_id,source,destination,manifest_sha256,str(tree_info.st_dev),str(tree_info.st_ino),marker))
+                        db.commit()
+                    except BaseException:
+                        db.rollback();clean_marker(tree,marker);raise
+                    phase('prepared')
+                else: marker = row[6]
+                # Re-scan after receipt creation; never act on a known stale tree.
+                if not matches_manifest(tree): raise Conflict('Folder changed; refresh its manifest before moving')
+                current = info(src_parent, src_name)
+                if not current or (current.st_dev,current.st_ino)!=(tree_info.st_dev,tree_info.st_ino): raise Conflict('Source folder changed')
+                libc = ctypes.CDLL(None, use_errno=True);rename = libc.renameat2
+                rename.argtypes = [ctypes.c_int,ctypes.c_char_p,ctypes.c_int,ctypes.c_char_p,ctypes.c_uint];rename.restype = ctypes.c_int
+                if rename(src_parent,os.fsencode(src_name),dst_parent,os.fsencode(dst_name),1) != 0:
+                    error=ctypes.get_errno();raise OSError(error,os.strerror(error))
+                phase('renamed');os.fsync(src_parent);os.fsync(dst_parent)
+                landed = info(dst_parent,dst_name)
+                if info(src_parent,src_name) is not None or not landed or (landed.st_dev,landed.st_ino)!=(tree_info.st_dev,tree_info.st_ino): raise Conflict('Folder move recovery is ambiguous; retain both paths for review')
+                if not marker_matches(tree,marker) or not matches_manifest(tree): raise Conflict('Folder changed during move; operation requires review')
+                db.execute('BEGIN IMMEDIATE');db.execute("UPDATE folder_move_receipts SET state='done' WHERE subject=? AND operation_id=? AND state='prepared'", (principal.sub,operation_id));db.commit();phase('committed')
+                clean_marker(tree,marker)
+                return {'operationId': operation_id, 'state': 'done'}
+            finally:
+                for descriptor in (tree, src_parent, dst_parent, read_home, list_home, home):
+                    if descriptor is not None: os.close(descriptor)
+
     def set_permission(self, subject, operation, allowed):
         if operation not in OPERATIONS or type(allowed) is not bool:
             raise ValueError('Invalid storage permission')
