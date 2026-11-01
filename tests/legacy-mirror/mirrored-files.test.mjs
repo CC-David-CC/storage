@@ -14,6 +14,21 @@ class Server{
  async remove(path,previous=null){this.check();const old=this.files.get(path);if(!old)throw Object.assign(Error('missing'),{status:404});if(!old.directory&&await sha(old.data)!==previous)throw Object.assign(Error('conflict'),{status:409});if(old.directory&&[...this.files.keys()].some(x=>x.startsWith(path+'/')))throw Error('not empty');this.files.delete(path);}
 }
 const pause=()=>new Promise(r=>setTimeout(r,0));
+// A source revision and new destination must be checked in one local
+// transaction, including when a second tab changes the source concurrently.
+const copyServer=new Server();copyServer.offline=true;
+const copyA=new MirroredFiles({scope:'atomic-copy',server:copyServer,retryMs:0}),copyB=new MirroredFiles({scope:'atomic-copy',server:copyServer,retryMs:0});
+let original=await copyA.write('/source.txt','first');await pause();
+await assert.rejects(()=>copyA.copyFile('/source.txt','/stale.txt','wrong-version'),/source file changed/);
+await assert.rejects(()=>copyA.copyFile('/source.txt','/source.txt',original.version),/different destination/);
+const race=await Promise.allSettled([copyA.copyFile('/source.txt','/copy.txt',original.version),copyB.write('/source.txt','second',original.version)]);
+assert.equal(race[1].status,'fulfilled');if(race[0].status==='fulfilled')assert.equal(new TextDecoder().decode((await copyA.read('/copy.txt')).data),'first');else assert.match(race[0].reason.message,/source file changed/);
+await assert.rejects(()=>copyA.copyFile('/source.txt','/late.txt',original.version),/source file changed/);await assert.rejects(()=>copyA.read('/late.txt'),/not found/);
+original=await copyA.read('/source.txt');await copyA.copyFile('/source.txt','/new.txt',original.version);await assert.rejects(()=>copyA.copyFile('/source.txt','/new.txt',original.version),/already exists/);
+const copyOther=new MirroredFiles({scope:'atomic-copy-other',server:new Server(),retryMs:0});await assert.rejects(()=>copyOther.copyFile('/source.txt','/leak.txt',original.version),/source file changed/);copyOther.close();
+copyServer.files.set('new.txt',{directory:false,data:new TextEncoder().encode('remote destination')});copyServer.offline=false;await copyA.sync();assert.equal((await copyA.read('/new.txt')).status,'conflict');assert.equal(new TextDecoder().decode((await copyServer.read('new.txt')).data),'remote destination');copyA.close();copyB.close();
+// A browser snapshot cannot detect a remote source edit it has not synced yet.
+const unseenServer=new Server();unseenServer.files.set('source.txt',{directory:false,data:new TextEncoder().encode('older')});const unseen=new MirroredFiles({scope:'unseen-source-copy',server:unseenServer,retryMs:0});await unseen.sync();const unseenVersion=(await unseen.read('/source.txt')).version;unseenServer.offline=true;unseenServer.files.set('source.txt',{directory:false,data:new TextEncoder().encode('newer elsewhere')});await unseen.copyFile('/source.txt','/copy.txt',unseenVersion);unseenServer.offline=false;await unseen.sync();assert.equal(new TextDecoder().decode((await unseen.read('/source.txt')).data),'newer elsewhere');assert.equal(new TextDecoder().decode((await unseen.read('/copy.txt')).data),'older');unseen.close();
 // Folder copies are local snapshots, including empty folders, that queue for
 // ordinary per-entry synchronization. Failed validation creates no partial tree.
 const treeServer=new Server(),treeMirror=new MirroredFiles({scope:'tree-copy',server:treeServer,retryMs:0});
