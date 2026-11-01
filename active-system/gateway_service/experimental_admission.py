@@ -19,6 +19,21 @@ _preverified=contextvars.ContextVar('codi_experimental_gateway_use',default=None
 class StaleEpoch(Exception):
     """A correctly signed enhanced proof names a previous gateway instance."""
 
+class VerificationLane:
+    """Bound work by endpoint; callers are not presumed authenticated."""
+    def __init__(self,slots,waiters):
+        self.slots=asyncio.Semaphore(slots);self.waiters=waiters;self.waiting=0
+    async def run(self,fn,*args):
+        if self.waiting>=self.waiters:raise web.HTTPTooManyRequests(text='Gateway verification queue full')
+        self.waiting+=1
+        try:
+            try:
+                async with asyncio.timeout(5):await self.slots.acquire()
+            except TimeoutError:raise web.HTTPTooManyRequests(text='Gateway verification queue timed out') from None
+        finally:self.waiting-=1
+        try:return await offload(fn,*args)
+        finally:self.slots.release()
+
 class Shares:
     """Separate bounded fixed-window counters; no account eviction within a window."""
     def __init__(self,*,verified=1536,legacy=256,invalid=256,per_account=240,max_accounts=4096,max_proofs=4096,clock=time.monotonic,wall=time.time):
@@ -51,9 +66,14 @@ class ExperimentalFileGateway(FileGateway):
         # Never persist or share this process instance's epoch. A proof signed
         # for an earlier process cannot be reused after a restart.
         self.admission_epoch=secrets.token_urlsafe(32)
-        if type(verification_slots) is not int or not 1<=verification_slots<=4 or type(verification_waiters) is not int or not 1<=verification_waiters<=128:raise ValueError('Bounded verification queue required')
+        if type(verification_slots) is not int or not 2<=verification_slots<=4 or type(verification_waiters) is not int or not 2<=verification_waiters<=128:raise ValueError('Bounded verification queues required')
         if type(challenge_read_slots) is not int or not 1<=challenge_read_slots<=4 or type(challenge_read_waiters) is not int or not 1<=challenge_read_waiters<=128:raise ValueError('Bounded challenge body queue required')
-        self.shares=shares or Shares();self.verification_slots=asyncio.Semaphore(verification_slots);self.verification_waiters=verification_waiters;self.verification_waiting=0
+        self.shares=shares or Shares()
+        # Both lanes contain unverified traffic. Fixed partitioning reserves
+        # capacity for uses without trusting a caller's claimed identity.
+        challenge_slots=verification_slots//2;challenge_waiters=verification_waiters//2
+        self.challenge_verify=VerificationLane(challenge_slots,challenge_waiters)
+        self.use_verify=VerificationLane(verification_slots-challenge_slots,verification_waiters-challenge_waiters)
         self.challenge_read_slots=asyncio.Semaphore(challenge_read_slots);self.challenge_read_waiters=challenge_read_waiters;self.challenge_read_waiting=0
         if sum(self.shares.limits.values())>self.max_requests_per_minute:raise ValueError('Admission shares exceed shared limit')
         self._real_begin=self.gate.begin
@@ -72,18 +92,6 @@ class ExperimentalFileGateway(FileGateway):
         expected='application/octet-stream' if request.raw_path=='/gateway/upload' else 'application/json'
         if request.content_type!=expected or request.charset not in (None,'utf-8') or request.headers.get('Content-Encoding') or request.headers.get('Transfer-Encoding'):raise Denied('Supported content type and explicit size required')
         if request.content_length is None or not 0<request.content_length<=MAX_REQUEST_BYTES:raise web.HTTPRequestEntityTooLarge(max_size=MAX_REQUEST_BYTES,actual_size=request.content_length or 0)
-    async def _acquire_verification(self):
-        if self.verification_waiting>=self.verification_waiters:raise web.HTTPTooManyRequests(text='Gateway verification queue full')
-        self.verification_waiting+=1
-        try:
-            try:
-                async with asyncio.timeout(5):await self.verification_slots.acquire()
-            except TimeoutError:raise web.HTTPTooManyRequests(text='Gateway verification queue timed out') from None
-        finally:self.verification_waiting-=1
-    async def _verify_slot(self,fn,*args):
-        await self._acquire_verification()
-        try:return await offload(fn,*args)
-        finally:self.verification_slots.release()
     async def _ticket_request(self,request):
         # A slow unauthenticated body must not hold a cryptographic slot needed
         # by an already-signed file use. Body readers and waiters remain bounded.
@@ -100,7 +108,7 @@ class ExperimentalFileGateway(FileGateway):
         finally:self.challenge_read_slots.release()
         # JSON parsing is also untrusted work and stays inside the verification
         # bound. The body never exceeds the endpoint's 16 KiB limit.
-        return await self._verify_slot(lambda:self._ticket(jose.loads(raw)))
+        return await self.challenge_verify.run(lambda:self._ticket(jose.loads(raw)))
     def _ticket(self,data):
         if not isinstance(data,dict) or set(data)!={'ticket','proof','request_sha256'}:raise Denied('Invalid admission envelope')
         request_sha=digest(data['request_sha256']);header,_,_,_=jose.inspect(data['ticket'],TICKET_TYPE,8192);authority=self.gate.keys.get(header.get('kid'))
@@ -135,7 +143,7 @@ class ExperimentalFileGateway(FileGateway):
                 return self._response(result)
             fields=request.headers.getall('Authorization',[]);parts=fields[0].split(' ') if len(fields)==1 else []
             if len(parts)!=3 or parts[0]!='Codi-File':self.shares.take('invalid');raise web.HTTPUnauthorized(text='Gateway identity proof required')
-            try:use=await self._verify_slot(lambda:self._real_begin(parts[1],parts[2],seconds=self.seconds))
+            try:use=await self.use_verify.run(lambda:self._real_begin(parts[1],parts[2],seconds=self.seconds))
             except (ValueError,TypeError,KeyError):self.shares.take('invalid');raise web.HTTPUnauthorized(text='Invalid, expired or already used gateway identity') from None
             self.shares.take('verified',use.principal.sub);token=_preverified.set((parts[1],parts[2],use))
             return await super().handle(request)
