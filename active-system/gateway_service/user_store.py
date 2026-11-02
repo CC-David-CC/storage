@@ -26,6 +26,8 @@ OPERATIONS = ('list', 'read', 'create', 'replace', 'mkdir', 'delete', 'rename')
 DEFAULT_ACCOUNT_FOLDERS = ('Documents', 'Digital Projects', '3D Objects', 'Games', 'Pictures', 'Audio', 'Video')
 class Conflict(Denied):
     """The caller's file version or create precondition no longer holds."""
+class CommitUncertain(OSError):
+    """The file was published but durable completion could not be confirmed."""
 SCHEMA = [
     'CREATE TABLE metadata (version INTEGER PRIMARY KEY CHECK(version=1))',
     "CREATE TABLE users (subject TEXT PRIMARY KEY, home_id TEXT UNIQUE NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','ready')), enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), created INTEGER NOT NULL)",
@@ -513,8 +515,9 @@ class UserStore:
                     stream.write(data);stream.flush();os.fsync(fd)
                 phase('staged')
                 self._publish(parent, temporary, name, replace=operation == 'replace')
-                temporary = None;os.fsync(parent)
-                phase('committed')
+                temporary = None
+                try:os.fsync(parent);phase('committed')
+                except Exception as error:raise CommitUncertain('File publication outcome uncertain') from error
                 return {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
             finally:
                 if temporary is not None:
@@ -568,7 +571,9 @@ class UserStore:
                     if stream.read(1) or digest.hexdigest()!=sha256:raise Denied('Upload size or hash changed')
                     target.flush();os.fsync(fd)
                 phase('staged');self._publish(parent,temporary,name,replace=operation=='replace')
-                temporary=None;os.fsync(parent);phase('committed')
+                temporary=None
+                try:os.fsync(parent);phase('committed')
+                except Exception as error:raise CommitUncertain('File publication outcome uncertain') from error
                 return {'bytes':size,'sha256':sha256}
             finally:
                 if temporary is not None:os.unlink(temporary,dir_fd=parent)

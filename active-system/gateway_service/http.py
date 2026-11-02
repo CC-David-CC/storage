@@ -20,7 +20,7 @@ from aiohttp import web
 from .auth import MAX_REQUEST_BYTES, Gatekeeper, jose
 from .policy import Denied, exact, parts
 from .transfers import Pacer, Quotas, AllowanceExceeded
-from .user_store import Conflict
+from .user_store import CommitUncertain, Conflict
 from . import delta, chunk_sync
 
 MAX_FILE_BYTES=128*1024*1024
@@ -341,6 +341,7 @@ class FileGateway:
                 return response
             if isinstance(error,web.HTTPException):status,message=error.status,error.text
             elif isinstance(error,FileNotFoundError):status,message=404,'File or folder not found'
+            elif isinstance(error,CommitUncertain):status,message=503,'The file may have been saved; check its current version before retrying'
             elif isinstance(error,(Conflict,FileExistsError)):status,message=409,'File changed or destination exists; reload before saving'
             elif isinstance(error,AllowanceExceeded):status,message=429,'Transfer allowance reached; try later'
             elif isinstance(error,TimeoutError):status,message=408,'File request timed out'
