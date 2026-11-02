@@ -1,6 +1,7 @@
 /** Account files over same-origin HTTPS. Never sends credentials to another URL. */
 import {hash,signJws,inspectJws,verifyJws,sameKey,validateTimes,nowSeconds,requireThat} from '../network/crypto.mjs';
 import {verifyIdentity,PROOF_TYPE} from '../network/identity.mjs';
+import {sha256 as incrementalSHA256} from './hash/core.mjs';
 
 const MAX_FILE=128*1024*1024,MAX_RESPONSE=192*1024*1024;
 export class FileRequestError extends Error{
@@ -79,6 +80,12 @@ async function chunksForBlob(blob,check=()=>{}){
   }
   if(length){const data=blob.slice(start,start+length);const sha256=await hexDigest(await data.arrayBuffer());check();chunks.push({offset:start,length,sha256,data});}
   return chunks;
+}
+// Verify a reconstructed file without allocating a second full-size buffer.
+async function hashBlobIncrementally(blob,check=()=>{}){
+  const hasher=incrementalSHA256.create();
+  for(let offset=0;offset<blob.size;offset+=262144){const bytes=new Uint8Array(await blob.slice(offset,offset+262144).arrayBuffer());check();hasher.update(bytes);await new Promise(resolve=>setTimeout(resolve,0));check();}
+  const result=hasher.hex();check();return result;
 }
 export class UserFiles{
   constructor(config,session,{sessionValid=()=>true}={}){
@@ -203,7 +210,7 @@ export class UserFiles{
       if(!data){const result=await this.request('chunk-read-v1',{path,previousSHA256:expected,offset,length,chunkSHA256:sha});this.check();requireThat(result?.offset===offset&&result.length===length&&result.sha256===sha&&typeof result.data==='string'&&result.data.length===Math.ceil(length/3)*4,'Invalid chunk response');const bytes=decode(result.data);requireThat(bytes.length===length&&await hexDigest(bytes)===sha,'Chunk integrity check failed');this.check();data=new Blob([bytes]);}
       parts.push(data);position+=length;
     }
-    requireThat(position===m.size,'Incomplete chunk manifest');const blob=new Blob(parts);const actual=await hexDigest(await blob.arrayBuffer());this.check();requireThat(actual===expected,'File integrity check failed');return {data:blob,sha256:actual};
+    requireThat(position===m.size,'Incomplete chunk manifest');const blob=new Blob(parts),actual=await hashBlobIncrementally(blob,()=>this.check());this.check();requireThat(actual===expected,'File integrity check failed');return {data:blob,sha256:actual};
   }
   async read(path){
     this.check();const capability=await fetch(this.base+'/binary-read-capabilities',{method:'GET',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:'no-referrer',signal:AbortSignal.timeout(10000)});this.check();
