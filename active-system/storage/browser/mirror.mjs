@@ -26,6 +26,7 @@ const storedSize=value=>value instanceof Blob?value.size:value.byteLength;
 const storedBytes=async value=>new Uint8Array(value instanceof Blob?await value.arrayBuffer():value.slice(0));
 async function digest(value){return [...new Uint8Array(await crypto.subtle.digest('SHA-256',value))].map(b=>b.toString(16).padStart(2,'0')).join('');}
 export class MirrorConflict extends Error{constructor(message='This file changed on another device. Choose which copy to keep.'){super(message);this.name='MirrorConflict';}}
+export class MirrorCommitUncertain extends Error{constructor(){super('Account changed after a local storage transaction committed. Reopen the original account and check the file before retrying.');this.name='MirrorCommitUncertain';}}
 export class MirroredFiles{
   #scope;#server;#valid;#captureAbort=new AbortController();#db;#opening;#running;#closed=false;#listeners=new Set();#timer;#retryMs;#rateFailures=0;#online;#visibility;#hasPending=true;#again=false;#lastError=null;#lastSynced=null;#checked=new Map();
   constructor({scope,server,valid=()=>true,onChange=()=>{},retryMs=15000}={}){
@@ -60,7 +61,7 @@ export class MirroredFiles{
   async #tx(mode,action){
     const db=await this.#open();this.#check();return new Promise((resolve,reject)=>{const tx=db.transaction('files',mode),store=tx.objectStore('files');let result,problem;
       const fail=e=>{problem=e;try{tx.abort();}catch{}};
-      tx.oncomplete=()=>{try{this.#check();resolve(result);}catch(e){reject(e);}};tx.onabort=tx.onerror=()=>reject(problem||tx.error||Error('Browser file storage failed.'));
+      tx.oncomplete=()=>{try{this.#check();resolve(result);}catch(e){reject(mode==='readwrite'?new MirrorCommitUncertain():e);}};tx.onabort=tx.onerror=()=>reject(problem||tx.error||Error('Browser file storage failed.'));
       try{action(store,value=>{result=value;},fail);}catch(e){fail(e);}
     });
   }
