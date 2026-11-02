@@ -934,6 +934,7 @@ class UserStore:
                 raise ValueError('Unknown ready registered storage account')
 
 
+    @_guard_mutation
     def word_count(self, principal, path, previous_sha256, *, phase=lambda name: None):
         """One bounded, idempotent document operation; the server owns its record.
 
@@ -992,6 +993,8 @@ class UserStore:
                               + '\nUTF-8 bytes: ' + str(len(source['bytes'])) + '\n').encode('utf-8')
                     report_sha = hashlib.sha256(report).hexdigest()
                     db.execute('INSERT INTO reports VALUES(?,?,?,?,?,?,?,0)', (operation_id, principal.sub, path, previous_sha256, output, report, report_sha))
+                    # SQLite commit errors may occur after the ledger has changed.
+                    _mark_mutated()
                     db.commit()
                     phase('accepted')
                     row = (principal.sub, path, previous_sha256, output, report, report_sha, 0)
@@ -1008,6 +1011,7 @@ class UserStore:
                         raise Conflict('The saved report was removed; this operation will not recreate it') from None
                     try:
                         self.put(principal, row[3], row[4])
+                        _mark_mutated()
                     except (Conflict, FileExistsError):
                         if self.read(principal, row[3])['sha256'] != row[5]:
                             raise Conflict('Report destination changed; no file was overwritten') from None
@@ -1016,6 +1020,7 @@ class UserStore:
                         raise Conflict('Report destination changed; no file was overwritten')
                 phase('published')
                 db.execute('UPDATE reports SET completed=1 WHERE id=?', (operation_id,))
+                _mark_mutated()
                 db.commit()
                 phase('completed')
                 return {'status': 'completed', 'operation': 'word-count', 'operationId': operation_id,
