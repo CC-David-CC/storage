@@ -33,7 +33,7 @@ function decode(text){
 // Checksums are hints only: the gateway verifies the whole reconstructed file.
 const DELTA_BLOCK=64*1024, DELTA_MOD=65521, DELTA_MAX_OPS=8192;
 const hexDigest=async bytes=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(b=>b.toString(16).padStart(2,'0')).join('');
-async function makeFileDelta(data,signature){
+async function makeFileDelta(data,signature,check=()=>{}){
   requireThat(data instanceof Uint8Array&&data.length<=MAX_FILE&&signature?.version==='codi-file-delta/1'&&signature.block===DELTA_BLOCK&&Number.isSafeInteger(signature.size)&&signature.size>=0&&signature.size<=MAX_FILE&&Array.isArray(signature.chunks)&&signature.chunks.length===Math.floor(signature.size/DELTA_BLOCK),'Invalid delta signature');
   const lookup=new Map();
   for(let i=0;i<signature.chunks.length;i++){
@@ -43,7 +43,9 @@ async function makeFileDelta(data,signature){
   const ops=[];let pos=0,literal=0,a=0,b=0,rolling=false;
   function copy(offset){const last=ops.at(-1);if(last?.type==='copy'&&last.offset+last.length===offset)last.length+=DELTA_BLOCK;else ops.push({type:'copy',offset,length:DELTA_BLOCK});}
   function insert(start,end){if(end>start)ops.push({type:'insert',start,end});}
+  let nextYield=0;
   while(pos+DELTA_BLOCK<=data.length){
+    if(pos>=nextYield){await new Promise(resolve=>setTimeout(resolve,0));check();nextYield=pos+256*1024;}
     if(!rolling){a=1;b=0;for(let i=pos;i<pos+DELTA_BLOCK;i++){a=(a+data[i])%DELTA_MOD;b=(b+a)%DELTA_MOD;}rolling=true;}
     const candidates=lookup.get((b*65536+a)>>>0);let source;
     if(candidates)source=candidates.get(await hexDigest(data.subarray(pos,pos+DELTA_BLOCK)));
@@ -203,7 +205,7 @@ export class UserFiles{
     if(previousSHA256!==null&&data.length>=2*DELTA_BLOCK&&await this.supportsDelta()){
       const signatures=await this.request('delta-signatures',{path,previousSHA256});
       requireThat(signatures?.sha256===previousSHA256,'Delta base version changed');
-      const patch=await makeFileDelta(data,signatures);this.check();
+      const patch=await makeFileDelta(data,signatures,()=>this.check());this.check();
       if(patch!==null){
         const sha256=await hexDigest(data),patchSHA256=await hexDigest(patch);this.check();
         return this.request('replace-delta',{path,format:'codi-file-delta/1',size:data.length,sha256,previousSHA256,patchSize:patch.length,patchSHA256},patch);

@@ -32,16 +32,28 @@ class ReadResponse:
     sha256: str
     binary: bool = False
 
-async def offload(function,*args,**kwargs):
+async def offload(function,*args,cancel_result=None,**kwargs):
     # Keep the admission slot until the actual disk/SQLite work finishes, even
     # if a client cancels; cancellation cannot create unbounded orphan workers.
     task=asyncio.create_task(asyncio.to_thread(function,*args,**kwargs))
     try:return await asyncio.shield(task)
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as cancelled:
+        # A caller may cancel again while disk work is still running. Shield
+        # every wait so a second cancellation cannot discard the worker result
+        # or release the admission slot before descriptor cleanup.
+        while True:
+            try:
+                result=await asyncio.shield(task)
+                break
+            except asyncio.CancelledError:
+                if task.cancelled():raise cancelled
+            except Exception:
+                raise cancelled from None
         try:
-            result=await task
             if isinstance(result,ReadResponse):os.close(result.fd)
-        finally:raise
+            elif cancel_result is not None:cancel_result(result)
+        finally:raise cancelled
+
 
 class FileGateway:
     def __init__(self, store, issuer_policy, *, base_path='', quotas=None, pacer=None, seconds_per_use=900, idle_seconds=5, upload_idle_seconds=60, max_requests_per_minute=256, max_waiters=128, queue_seconds=5):
@@ -139,7 +151,7 @@ class FileGateway:
             await offload(temporary.seek,0)
             if not is_delta:
                 return await offload(self.store.put_stream,principal,path,temporary,size,digest,previous_sha256=metadata.get('previousSHA256'))
-            fd,base_size,base_hash=await offload(self.store.open_read_snapshot,principal,path,maximum_bytes=min(MAX_FILE_BYTES,self.store.per_user_bytes))
+            fd,base_size,base_hash=await offload(self.store.open_read_snapshot,principal,path,maximum_bytes=min(MAX_FILE_BYTES,self.store.per_user_bytes),cancel_result=lambda snapshot:os.close(snapshot[0]))
             try:
                 if base_hash!=metadata['previousSHA256']:raise Conflict('File changed before delta reconstruction')
                 with tempfile.TemporaryFile(mode='w+b') as rebuilt:
