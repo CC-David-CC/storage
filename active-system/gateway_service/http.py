@@ -68,6 +68,7 @@ class FileGateway:
         self.slots=asyncio.Semaphore(4);self.waiting=0;self.max_waiters=max_waiters;self.queue_seconds=queue_seconds
         self.window=0;self.requests=0
         self.client_source=Path(__file__).with_name('client.mjs').read_bytes()
+        source=Path(__file__).parent/'vendor/js-sha256';self.sha_modules={name:(source/name).read_bytes() for name in ('core.mjs','shared.mjs')}
         self.chunk_cache=chunk_sync.SnapshotCache(store)
 
     def app(self):
@@ -245,9 +246,11 @@ class FileGateway:
     async def handle(self, request):
         admitted=False;transfer=None;response=None;read_fd=None
         try:
-            if request.method=='GET' and request.raw_path in ('/gateway/client.mjs','/gateway/capabilities','/gateway/version-batch-capabilities','/gateway/inventory-capabilities','/gateway/inventory-versions-capabilities','/gateway/upload-capabilities','/gateway/delta-capabilities','/gateway/chunk-capabilities','/gateway/binary-read-capabilities','/healthz'):
+            if request.method=='GET' and request.raw_path in ('/gateway/client.mjs','/gateway/hash/core.mjs','/gateway/hash/shared.mjs','/gateway/capabilities','/gateway/version-batch-capabilities','/gateway/inventory-capabilities','/gateway/inventory-versions-capabilities','/gateway/upload-capabilities','/gateway/delta-capabilities','/gateway/chunk-capabilities','/gateway/binary-read-capabilities','/healthz'):
                 if request.headers.get('Host')!=self.host:raise web.HTTPForbidden()
                 if request.raw_path=='/healthz':return self._response({'status':'ok','scope':'personal-files'})
+                if request.raw_path in ('/gateway/hash/core.mjs','/gateway/hash/shared.mjs'):
+                    return web.Response(body=self.sha_modules[request.raw_path.rsplit('/',1)[1]],content_type='text/javascript',headers={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'})
                 if request.raw_path=='/gateway/capabilities':return self._response({'version':'codi-file-capabilities/1','fileVersion':True})
                 if request.raw_path=='/gateway/version-batch-capabilities':return self._response({'version':'codi-file-version-batch/1','maxPaths':16})
                 if request.raw_path=='/gateway/inventory-versions-capabilities':return self._response({'version':'codi-file-inventory-versions/1','maxDirectories':128,'maxEntries':2048,'maxHashedFiles':64,'maxHashBytes':32*1024*1024})
