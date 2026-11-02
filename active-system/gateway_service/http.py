@@ -68,10 +68,13 @@ class FileGateway:
         self.slots=asyncio.Semaphore(4);self.waiting=0;self.max_waiters=max_waiters;self.queue_seconds=queue_seconds
         self.window=0;self.requests=0
         self.client_source=Path(__file__).with_name('client.mjs').read_bytes()
+        self.chunk_cache=chunk_sync.SnapshotCache(store)
 
     def app(self):
         app=web.Application(client_max_size=MAX_REQUEST_BYTES,handler_args={'keepalive_timeout':5,'lingering_time':0,'max_line_size':8190,'max_field_size':8190,'max_headers':32,'read_bufsize':65536,'auto_decompress':False})
         app.router.add_route('*','/{tail:.*}',self.handle)
+        async def clear_cache(_app):self.chunk_cache.close()
+        app.on_cleanup.append(clear_cache)
         return app
 
     def _headers(self, request):
@@ -169,11 +172,13 @@ class FileGateway:
             if request['resource']!='my-files' or not isinstance(version,str) or not re.fullmatch('[0-9a-f]{64}',version):raise Denied('Exact account file version required')
             path='/'.join(parts(request['path']))
             if not path:raise Denied('File path required')
-            fd,size,sha256=self.store.open_read_snapshot(principal,path,maximum_bytes=min(MAX_FILE_BYTES,self.store.per_user_bytes))
+            maximum=min(MAX_FILE_BYTES,self.store.per_user_bytes)
+            fd,size,description,identity=self.chunk_cache.open(principal,path,version,maximum)
             try:
-                if sha256!=version:raise Conflict('File changed before chunk read')
-                if operation=='chunk-manifest-v1':return chunk_sync.manifest(fd,size,sha256)
-                return chunk_sync.read_chunk(fd,size,request['offset'],request['length'],request['chunkSHA256'])
+                if operation=='chunk-manifest-v1':result=description
+                else:result=chunk_sync.read_chunk(fd,size,request['offset'],request['length'],request['chunkSHA256'])
+                if self.store.file_identity(principal,path,maximum_bytes=maximum)!=identity:raise Conflict('File changed during chunk read')
+                return result
             finally:os.close(fd)
         if operation=='delta-signatures':
             exact(request,['resource','operation','path','previousSHA256'])
@@ -240,7 +245,7 @@ class FileGateway:
     async def handle(self, request):
         admitted=False;transfer=None;response=None;read_fd=None
         try:
-            if request.method=='GET' and request.raw_path in ('/gateway/client.mjs','/gateway/capabilities','/gateway/version-batch-capabilities','/gateway/inventory-capabilities','/gateway/inventory-versions-capabilities','/gateway/upload-capabilities','/gateway/delta-capabilities','/gateway/binary-read-capabilities','/healthz'):
+            if request.method=='GET' and request.raw_path in ('/gateway/client.mjs','/gateway/capabilities','/gateway/version-batch-capabilities','/gateway/inventory-capabilities','/gateway/inventory-versions-capabilities','/gateway/upload-capabilities','/gateway/delta-capabilities','/gateway/chunk-capabilities','/gateway/binary-read-capabilities','/healthz'):
                 if request.headers.get('Host')!=self.host:raise web.HTTPForbidden()
                 if request.raw_path=='/healthz':return self._response({'status':'ok','scope':'personal-files'})
                 if request.raw_path=='/gateway/capabilities':return self._response({'version':'codi-file-capabilities/1','fileVersion':True})
@@ -249,6 +254,7 @@ class FileGateway:
                 if request.raw_path=='/gateway/inventory-capabilities':return self._response({'version':'codi-file-inventory/1','maxDirectories':128,'maxEntries':2048})
                 if request.raw_path=='/gateway/upload-capabilities':return self._response({'version':'codi-binary-upload/1','maxBytes':MAX_FILE_BYTES})
                 if request.raw_path=='/gateway/delta-capabilities':return self._response({'version':'codi-file-delta/1','block':delta.BLOCK,'maxBytes':MAX_FILE_BYTES,'maxOps':delta.MAX_OPS})
+                if request.raw_path=='/gateway/chunk-capabilities':return self._response({'version':'codi-file-chunks/1','maxBytes':MAX_FILE_BYTES})
                 if request.raw_path=='/gateway/binary-read-capabilities':return self._response({'version':'codi-binary-read/1','maxBytes':MAX_FILE_BYTES})
                 return web.Response(body=self.client_source,content_type='text/javascript',headers={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'})
             self._headers(request);await self._admit();admitted=True

@@ -288,6 +288,21 @@ class UserStore:
                     if descriptor is not None:
                         os.close(descriptor)
 
+    def file_identity(self,principal,path,*,maximum_bytes):
+        """Authorize and identify the current path without hashing its contents."""
+        maximum=integer(maximum_bytes,1,self.per_user_bytes)
+        with self.lock(),self.db() as db:
+            home=self._authorized(db,principal,'read');parent=fd=None
+            try:
+                parent,name=self._parent(home,path)
+                fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,dir_fd=parent)
+                info=self._data_stat(fd)
+                if info.st_size>maximum:raise Denied('File size limit exceeded')
+                return (info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+            finally:
+                for descriptor in [fd,parent,home]:
+                    if descriptor is not None:os.close(descriptor)
+
     def open_read_snapshot(self,principal,path,*,maximum_bytes):
         """Open one private file and hash it in chunks; caller owns the returned fd.
 
