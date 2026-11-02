@@ -5,6 +5,7 @@ This module never authenticates a browser-supplied username or Linux UID. No
 anonymous path can allocate a user row or folder. Files are not a public web tree.
 """
 from contextlib import contextmanager
+from contextvars import ContextVar
 import ctypes
 import errno
 import fcntl
@@ -19,6 +20,7 @@ import stat
 import time
 from urllib.parse import quote
 import uuid
+from functools import wraps
 
 from .policy import Denied, Principal, integer, parts
 
@@ -27,7 +29,33 @@ DEFAULT_ACCOUNT_FOLDERS = ('Documents', 'Digital Projects', '3D Objects', 'Games
 class Conflict(Denied):
     """The caller's file version or create precondition no longer holds."""
 class CommitUncertain(OSError):
-    """The file was published but durable completion could not be confirmed."""
+    """A storage mutation occurred but successful completion was not confirmed."""
+_mutation_state=ContextVar('codi_storage_mutation_state',default=None)
+def _guard_mutation(function):
+    """Classify failures after a successful mutation, including cleanup."""
+    @wraps(function)
+    def guarded(*args,**kwargs):
+        state={'changed':False};token=_mutation_state.set(state)
+        try:return function(*args,**kwargs)
+        except Exception as error:
+            if state['changed'] and not isinstance(error,CommitUncertain):
+                raise CommitUncertain('Storage mutation outcome uncertain') from error
+            raise
+        finally:_mutation_state.reset(token)
+    return guarded
+def _mark_mutated():
+    state=_mutation_state.get()
+    if state is None:raise RuntimeError('Mutation guard missing')
+    state['changed']=True
+def _close_descriptors(descriptors):
+    """Attempt every close even when one descriptor reports an error."""
+    first=None
+    for descriptor in descriptors:
+        if descriptor is not None:
+            try:os.close(descriptor)
+            except OSError as error:
+                if first is None:first=error
+    if first is not None:raise first
 SCHEMA = [
     'CREATE TABLE metadata (version INTEGER PRIMARY KEY CHECK(version=1))',
     "CREATE TABLE users (subject TEXT PRIMARY KEY, home_id TEXT UNIQUE NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','ready')), enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), created INTEGER NOT NULL)",
@@ -482,6 +510,7 @@ class UserStore:
                     os.close(fd)
         return users, total_size, total_entries
 
+    @_guard_mutation
     def put(self, principal, path, data, *, previous_sha256=None, phase=lambda name: None):
         if not isinstance(data, bytes) or len(data) > self.per_user_bytes:
             raise Denied('Save size limit exceeded')
@@ -515,17 +544,16 @@ class UserStore:
                     stream.write(data);stream.flush();os.fsync(fd)
                 phase('staged')
                 self._publish(parent, temporary, name, replace=operation == 'replace')
+                _mark_mutated()
                 temporary = None
-                try:os.fsync(parent);phase('committed')
-                except Exception as error:raise CommitUncertain('File publication outcome uncertain') from error
+                os.fsync(parent);phase('committed')
                 return {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
             finally:
-                if temporary is not None:
-                    os.unlink(temporary, dir_fd=parent)
-                for descriptor in [old, fd, parent, home]:
-                    if descriptor is not None:
-                        os.close(descriptor)
+                try:
+                    if temporary is not None:os.unlink(temporary, dir_fd=parent)
+                finally:_close_descriptors([old,fd,parent,home])
 
+    @_guard_mutation
     def put_stream(self, principal, path, stream, size, sha256, *, previous_sha256=None, phase=lambda name: None):
         """Publish a verified, bounded temporary upload without loading it into RAM.
 
@@ -571,15 +599,16 @@ class UserStore:
                     if stream.read(1) or digest.hexdigest()!=sha256:raise Denied('Upload size or hash changed')
                     target.flush();os.fsync(fd)
                 phase('staged');self._publish(parent,temporary,name,replace=operation=='replace')
+                _mark_mutated()
                 temporary=None
-                try:os.fsync(parent);phase('committed')
-                except Exception as error:raise CommitUncertain('File publication outcome uncertain') from error
+                os.fsync(parent);phase('committed')
                 return {'bytes':size,'sha256':sha256}
             finally:
-                if temporary is not None:os.unlink(temporary,dir_fd=parent)
-                for descriptor in [old,fd,parent,home]:
-                    if descriptor is not None:os.close(descriptor)
+                try:
+                    if temporary is not None:os.unlink(temporary,dir_fd=parent)
+                finally:_close_descriptors([old,fd,parent,home])
 
+    @_guard_mutation
     def mkdir(self, principal, path):
         with self.lock(), self.db() as db:
             home = self._authorized(db, principal, 'mkdir');parent = None
@@ -588,12 +617,11 @@ class UserStore:
                 usage, _, entries = self._usage(clean_staging=True)
                 if usage[registered(principal)][1] >= self.per_user_entries or entries >= self.total_entries:
                     raise Denied('Storage entry quota exceeded')
-                os.mkdir(name, mode=0o700, dir_fd=parent);os.fsync(parent)
+                os.mkdir(name, mode=0o700, dir_fd=parent);_mark_mutated();os.fsync(parent)
             finally:
-                for fd in [parent, home]:
-                    if fd is not None:
-                        os.close(fd)
+                _close_descriptors([parent,home])
 
+    @_guard_mutation
     def delete(self, principal, path, *, previous_sha256=None):
         """Delete a version-matched file or an empty directory; never recursive."""
         with self.lock(), self.db() as db:
@@ -608,12 +636,11 @@ class UserStore:
                     if hashlib.sha256(self._read(fd, self.per_user_bytes)).hexdigest() != previous_sha256:
                         raise Conflict('File changed; reload before deleting it')
                     os.unlink(name, dir_fd=parent)
-                os.fsync(parent)
+                _mark_mutated();os.fsync(parent)
             finally:
-                for descriptor in [fd, parent, home]:
-                    if descriptor is not None:
-                        os.close(descriptor)
+                _close_descriptors([fd,parent,home])
 
+    @_guard_mutation
     def rename(self, principal, source, destination, *, previous_sha256=None):
         """Rename a version-matched file; target must not exist."""
         with self.lock(), self.db() as db:
@@ -630,11 +657,10 @@ class UserStore:
                 rename.restype = ctypes.c_int
                 if rename(parent, os.fsencode(name), target, os.fsencode(new_name), 1) != 0:
                     error = ctypes.get_errno();raise OSError(error, os.strerror(error))
+                _mark_mutated()
                 os.fsync(parent);os.fsync(target)
             finally:
-                for descriptor in [fd, parent, target, home]:
-                    if descriptor is not None:
-                        os.close(descriptor)
+                _close_descriptors([fd,parent,target,home])
 
     def folder_manifest(self, principal, path):
         """Return a bounded content manifest; no folder-move endpoint is exposed."""

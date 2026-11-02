@@ -119,7 +119,7 @@ class FileGateway:
             chunks.write(chunk);total+=len(chunk)
         return chunks.getvalue()
 
-    async def _upload(self,request,use,principal,deadline):
+    async def _upload(self,request,use,principal,deadline,mutation_dispatched=lambda:None,mutation_completed=lambda:None):
         prefix=await self._read(request,principal=principal,deadline=deadline,length=4,idle=self.upload_idle)
         length=struct.unpack('>I',prefix)[0]
         if not 1<=length<=8192 or 4+length>request.content_length:raise Denied('Bounded upload metadata required')
@@ -154,13 +154,17 @@ class FileGateway:
             if hasher.hexdigest()!=wire_digest:raise Denied('Upload hash changed')
             await offload(temporary.seek,0)
             if not is_delta:
-                return await offload(self.store.put_stream,principal,path,temporary,size,digest,previous_sha256=metadata.get('previousSHA256'))
+                mutation_dispatched()
+                result=await offload(self.store.put_stream,principal,path,temporary,size,digest,previous_sha256=metadata.get('previousSHA256'))
+                mutation_completed();return result
             fd,base_size,base_hash=await offload(self.store.open_read_snapshot,principal,path,maximum_bytes=min(MAX_FILE_BYTES,self.store.per_user_bytes),cancel_result=lambda snapshot:os.close(snapshot[0]))
             try:
                 if base_hash!=metadata['previousSHA256']:raise Conflict('File changed before delta reconstruction')
                 with tempfile.TemporaryFile(mode='w+b') as rebuilt:
                     await offload(delta.apply_patch,fd,base_size,temporary,received_size,rebuilt,size,digest)
-                    return await offload(self.store.put_stream,principal,path,rebuilt,size,digest,previous_sha256=base_hash)
+                    mutation_dispatched()
+                    result=await offload(self.store.put_stream,principal,path,rebuilt,size,digest,previous_sha256=base_hash)
+                    mutation_completed();return result
             finally:os.close(fd)
 
     def _dispatch(self, principal, request):
@@ -245,6 +249,9 @@ class FileGateway:
 
     async def handle(self, request):
         admitted=False;transfer=None;response=None;read_fd=None
+        mutation={'dispatched':False,'completed':False}
+        def mark_dispatched():mutation['dispatched']=True
+        def mark_completed():mutation['completed']=True
         try:
             if request.method=='GET' and request.raw_path in ('/gateway/client.mjs','/gateway/hash/core.mjs','/gateway/hash/shared.mjs','/gateway/hash/verify-worker.mjs','/gateway/capabilities','/gateway/version-batch-capabilities','/gateway/inventory-capabilities','/gateway/inventory-versions-capabilities','/gateway/upload-capabilities','/gateway/delta-capabilities','/gateway/chunk-capabilities','/gateway/binary-read-capabilities','/healthz'):
                 if request.headers.get('Host')!=self.host:raise web.HTTPForbidden()
@@ -282,13 +289,15 @@ class FileGateway:
             deadline=time.monotonic()+max(0,principal.deadline-self.store.clock())
             async with asyncio.timeout(max(.001,deadline-time.monotonic())):
                 if request.raw_path=='/gateway/upload':
-                    result=await self._upload(request,use,principal,deadline)
+                    result=await self._upload(request,use,principal,deadline,mark_dispatched,mark_completed)
                 else:
                     raw=await self._read(request,principal=principal,deadline=deadline)
                     data=use.decode(raw)
                     del raw
+                    if data.get('operation') in ('create','replace','delete','rename','mkdir','word-count'):mark_dispatched()
                     result=await offload(self._dispatch,principal,data)
                     del data
+                if mutation['dispatched']:mutation['completed']=True
                 if isinstance(result,ReadResponse):
                     if result.binary:
                         read_fd=result.fd;length=result.size
@@ -339,9 +348,10 @@ class FileGateway:
                 response.force_close()
                 if request.transport:request.transport.close()
                 return response
-            if isinstance(error,web.HTTPException):status,message=error.status,error.text
+            if mutation['completed'] or isinstance(error,CommitUncertain) or (mutation['dispatched'] and isinstance(error,TimeoutError)):
+                status,message=503,'The operation may have completed; check the current file state before retrying'
+            elif isinstance(error,web.HTTPException):status,message=error.status,error.text
             elif isinstance(error,FileNotFoundError):status,message=404,'File or folder not found'
-            elif isinstance(error,CommitUncertain):status,message=503,'The file may have been saved; check its current version before retrying'
             elif isinstance(error,(Conflict,FileExistsError)):status,message=409,'File changed or destination exists; reload before saving'
             elif isinstance(error,AllowanceExceeded):status,message=429,'Transfer allowance reached; try later'
             elif isinstance(error,TimeoutError):status,message=408,'File request timed out'
