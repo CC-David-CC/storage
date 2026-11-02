@@ -1,21 +1,14 @@
-import {readFile} from 'node:fs/promises';
-import {webcrypto,createHash} from 'node:crypto';
-import assert from 'node:assert/strict';
-const src=await readFile(new URL('../active-system/gateway_service/client.mjs',import.meta.url),'utf8');
-const code=src.slice(src.indexOf('const DELTA_BLOCK='),src.indexOf('export class UserFiles'));
-const requireThat=(ok,msg)=>{if(!ok)throw Error(msg)};
-function build(crypto){return Function('requireThat','MAX_FILE','crypto',code+';return makeFileDelta;')(requireThat,128*1024*1024,crypto)}
-const block=65536, weak=787416541;
-const data=new Uint8Array(1024*1024);for(let i=0;i<data.length;i++)data[i]=[101,98,101,100][i%4];
-const sig={version:'codi-file-delta/1',size:block,block,chunks:[[weak,'f'.repeat(64)]]};
-let calls=0;const capped={subtle:{async digest(name,view){calls++;return webcrypto.subtle.digest(name,view)}}};
-assert.equal(await build(capped)(data,sig),null);assert.equal(calls,64,'failed hashes should be bounded');
-let release;const gate=new Promise(r=>release=r);calls=0;let allowed=true;
-const suspended={subtle:{async digest(){calls++;await gate;return new Uint8Array(32).buffer}}};
-const pending=build(suspended)(data,sig,()=>{if(!allowed)throw Error('closed')});
-while(calls===0)await new Promise(r=>setTimeout(r,0));allowed=false;release();await assert.rejects(pending,/closed/);assert.equal(calls,1);
-const zeros=new Uint8Array(128*1024*1024);let a=1,b=0;for(let i=0;i<block;i++){a%=65521;b=(b+a)%65521}const weakZero=(b*65536+a)>>>0;
-const strong=createHash('sha256').update(zeros.subarray(0,block)).digest('hex');
-const bigsig={version:'codi-file-delta/1',size:zeros.length,block,chunks:Array.from({length:zeros.length/block},()=>[weakZero,strong])};
-calls=0;const patch=await build(capped)(zeros,bigsig);assert.ok(patch&&patch.length<100000,'matching full-size file should still be patched');assert.equal(calls,2048,'successful hashes do not consume failed-match budget');
-console.log('PASS: collision budget, cancellation after digest and 128 MiB successful matching');
+import {createHash,webcrypto} from 'node:crypto';import assert from 'node:assert/strict';
+import {deltaBlob} from '../active-system/gateway_service/vendor/js-sha256/verify-worker.mjs';
+const block=65536,weak=787416541;let calls=0;
+const original=globalThis.crypto;Object.defineProperty(globalThis,'crypto',{configurable:true,value:{subtle:{digest(...args){calls++;return webcrypto.subtle.digest(...args)}}}});
+try{
+ const data=new Uint8Array(1024*1024);for(let i=0;i<data.length;i++)data[i]=[101,98,101,100][i%4];
+ const sig={version:'codi-file-delta/1',size:block,block,chunks:[[weak,'f'.repeat(64)]]};
+ assert.equal(await deltaBlob(new Blob([data]),sig),null);assert.equal(calls,64,'failed strong hashes must be bounded');
+ calls=0;let checks=0;await assert.rejects(deltaBlob(new Blob([data]),sig,()=>{if(++checks===2)throw Error('closed')}),/closed/);assert.equal(calls,1,'cancellation must stop after the awaited digest');
+ const zeros=new Uint8Array(block);let a=1,b=0;for(let i=0;i<block;i++){a%=65521;b=(b+a)%65521}const weakZero=(b*65536+a)>>>0,strong=createHash('sha256').update(zeros).digest('hex');
+ const full=new Blob(Array.from({length:2048},()=>zeros)),fullsig={version:'codi-file-delta/1',size:full.size,block,chunks:Array.from({length:2048},()=>[weakZero,strong])};calls=0;
+ const result=await deltaBlob(full,fullsig);assert.ok(result instanceof Blob&&result.size<100000);assert.equal(calls,2048,'successful matches must not consume failed-match budget');
+ console.log('PASS worker delta collision budget, cancellation and 128 MiB successful matching');
+}finally{Object.defineProperty(globalThis,'crypto',{configurable:true,value:original})}
