@@ -44,7 +44,7 @@ async function runFileWorker(operation,blob,check=()=>{},signal=null,extra={}){
     try{
       signal?.addEventListener('abort',abort,{once:true});
       worker.onerror=()=>finish(Error('File verification worker failed'));worker.onmessageerror=()=>finish(Error('Invalid verification worker message'));
-      worker.onmessage=event=>{try{check();const data=event.data;if(!data||data.operation!==operation||data.error)throw Error('File verification worker failed');finish(null,data.value)}catch(error){finish(error)}};
+      worker.onmessage=event=>{try{check();const data=event.data;if(!data||data.operation!==operation||data.error)throw Error('File verification worker failed');if(Object.hasOwn(data,'progress')){requireThat(Number.isSafeInteger(data.progress)&&data.progress>=0&&data.progress<=blob.size,'Invalid worker progress');return}finish(null,data.value)}catch(error){finish(error)}};
       check();if(signal?.aborted)abort();else worker.postMessage({...extra,operation,blob});
     }catch(error){finish(error)}
   })}finally{worker.terminate()}
@@ -59,6 +59,12 @@ export class UserFiles{
   }
   check(){requireThat(this.valid()&&this.session.public.kind==='registered','Sign in to access your server files');}
   get acceptsBlobWrites(){return true;}
+  async captureSnapshot(blob,{signal=null}={}){
+    const check=()=>{this.check();if(signal?.aborted)throw new DOMException('Cancelled','AbortError')};check();
+    requireThat(['[object Blob]','[object File]'].includes(Object.prototype.toString.call(blob))&&Number.isSafeInteger(blob.size)&&blob.size>=0&&blob.size<=MAX_FILE,'Files are limited to 128 MiB');
+    const result=await runFileWorker('capture',blob,check,signal);check();
+    requireThat(result&&result.blob instanceof Blob&&result.blob.size===blob.size&&typeof result.sha256==='string'&&/^[0-9a-f]{64}$/.test(result.sha256),'Invalid captured file');return result;
+  }
   async post(path,body,{token=null,headers={},timeout=15000}={}){
     this.check();
     const response=await fetch(path,{method:'POST',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:'no-referrer',
