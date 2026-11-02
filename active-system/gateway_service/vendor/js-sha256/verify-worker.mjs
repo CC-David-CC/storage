@@ -17,6 +17,21 @@ export async function chunkBlob(blob,check=()=>{}){
   if(length){const sum=await hex(await blob.slice(start,start+length).arrayBuffer());check();chunks.push([start,length,sum]);}
   return chunks;
 }
+// Capture real bytes, rather than retaining an OS-backed File reference.
+// A second source pass detects ordinary concurrent source changes.
+export async function captureBlob(blob,check=()=>{},progress=()=>{}){
+  if(!(blob instanceof Blob)||blob.size>MAX)throw Error('Invalid input');
+  const hash=sha256.create(),parts=[];
+  for(let offset=0;offset<blob.size;offset+=262144){
+    const length=Math.min(262144,blob.size-offset),bytes=new Uint8Array(await blob.slice(offset,offset+length).arrayBuffer());check();
+    if(bytes.length!==length)throw Error('Source changed during capture');hash.update(bytes);parts.push(new Blob([bytes]));
+    if(offset===0||(offset+length)%(4*1024*1024)===0)progress(offset+length);
+  }
+  const expected=hash.hex();check();const again=await hashBlob(blob,check);check();
+  if(expected!==again)throw Error('Source changed during capture');
+  return {blob:new Blob(parts),sha256:expected};
+}
+
 // Construct the existing copy/literal delta format from a bounded rolling
 // window. Literal Blob slices reference the snapshot without reading it whole.
 const BLOCK=65536,MOD=65521,MAX_OPS=8192,MAX_FAILED=64;
@@ -46,6 +61,7 @@ if(typeof self!=='undefined'&&typeof self.postMessage==='function')self.onmessag
   try{const {operation,blob,signature}=event.data||{};let value;
     if(operation==='hash')value=await hashBlob(blob);
     else if(operation==='chunks')value=await chunkBlob(blob);
+    else if(operation==='capture')value=await captureBlob(blob,()=>{},progress=>self.postMessage({operation,progress}));
     else if(operation==='delta'){const patch=await deltaBlob(blob,signature);value={patch,sha256:await hashBlob(blob),patchSHA256:patch?await hashBlob(patch):null};}
     else throw Error('Unsupported operation');
     self.postMessage({operation,value});

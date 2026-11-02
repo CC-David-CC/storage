@@ -16,6 +16,7 @@ const name=path=>path.slice(path.lastIndexOf('/')+1);
 // first await: callers may mutate their input while the digest is pending.
 const byteArray=value=>ArrayBuffer.isView(value)&&Object.prototype.toString.call(value)==='[object Uint8Array]';
 const rawBuffer=value=>Object.prototype.toString.call(value)==='[object ArrayBuffer]';
+const blobValue=value=>['[object Blob]','[object File]'].includes(Object.prototype.toString.call(value));
 const bytes=value=>typeof value==='string'?new TextEncoder().encode(value):byteArray(value)?new Uint8Array(value):rawBuffer(value)?new Uint8Array(ArrayBuffer.prototype.slice.call(value,0)):null;
 const localQueues=new Map();
 function serializeLocal(key,operation){const previous=localQueues.get(key)??Promise.resolve(),current=previous.catch(()=>{}).then(operation);localQueues.set(key,current);current.finally(()=>{if(localQueues.get(key)===current)localQueues.delete(key);}).catch(()=>{});return current;}
@@ -26,7 +27,7 @@ const storedBytes=async value=>new Uint8Array(value instanceof Blob?await value.
 async function digest(value){return [...new Uint8Array(await crypto.subtle.digest('SHA-256',value))].map(b=>b.toString(16).padStart(2,'0')).join('');}
 export class MirrorConflict extends Error{constructor(message='This file changed on another device. Choose which copy to keep.'){super(message);this.name='MirrorConflict';}}
 export class MirroredFiles{
-  #scope;#server;#valid;#db;#opening;#running;#closed=false;#listeners=new Set();#timer;#retryMs;#rateFailures=0;#online;#visibility;#hasPending=true;#again=false;#lastError=null;#lastSynced=null;#checked=new Map();
+  #scope;#server;#valid;#captureAbort=new AbortController();#db;#opening;#running;#closed=false;#listeners=new Set();#timer;#retryMs;#rateFailures=0;#online;#visibility;#hasPending=true;#again=false;#lastError=null;#lastSynced=null;#checked=new Map();
   constructor({scope,server,valid=()=>true,onChange=()=>{},retryMs=15000}={}){
     need(typeof scope==='string'&&scope.length>0&&scope.length<=512&&server&&typeof valid==='function'&&typeof onChange==='function','Authenticated file mirror required.');
     need(typeof retryMs==='number'&&Number.isFinite(retryMs)&&retryMs>=0,'Invalid sync retry interval.');
@@ -76,7 +77,7 @@ export class MirroredFiles{
   async stat(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');this.#check();return {bytes:storedSize(r.data),sha256:r.sha256,version:r.version,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
   async read(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');const data=await storedBytes(r.data);this.#check();return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
   async write(path,data,expected=null){
-    path=filePath(path);need(path!=='/','Enter a filename.');const incoming=data instanceof Blob?data:null;
+    path=filePath(path);need(path!=='/','Enter a filename.');const incoming=blobValue(data)?data:null;
     // Reject oversize byte inputs before allocating a snapshot of them.
     const hint=incoming?incoming.size:byteArray(data)||rawBuffer(data)?data.byteLength:null;
     if(hint!==null)need(Number.isSafeInteger(hint)&&hint<=MAX_FILE,'Files are limited to 128 MiB.');
@@ -84,7 +85,14 @@ export class MirroredFiles{
     // A File from an upload picker can still reference the source on disk even
     // after IndexedDB stores it. Snapshot it before the picker source vanishes.
     // The same bytes are needed for the digest; do not read the input twice.
-    const snapshot=incoming?await incoming.arrayBuffer():copy,sha256=await digest(snapshot),stored=new Blob([snapshot]);this.#check();
+    let stored,sha256;
+    if(typeof this.#server.captureSnapshot==='function'){
+      const source=incoming||new Blob([copy]);const result=await this.#server.captureSnapshot(source,{signal:this.#captureAbort.signal});this.#check();
+      need(result?.blob instanceof Blob&&result.blob.size===size&&typeof result.sha256==='string'&&/^[0-9a-f]{64}$/.test(result.sha256),'Invalid file capture.');stored=result.blob;sha256=result.sha256;
+    }else{
+      // Older server adapters retain their original capture behavior.
+      const snapshot=incoming?await incoming.arrayBuffer():copy;sha256=await digest(snapshot);stored=new Blob([snapshot]);this.#check();
+    }
     const result=await this.#mutate(path,(old,all)=>{if(parent(path)!=='/'){const p=all.find(r=>r.path===parent(path));need(p&&!p.deleted&&p.directory,'Create the parent folder first.');}need(all.length<MAX_ENTRIES||old,'Browser file limit reached.');if(old?.moving)throw Error('Wait for this move to finish syncing.');if(expected===null?!!old:!old||old.deleted||old.directory||old.version!==expected)throw new MirrorConflict('This file changed; reload it before saving.');
       const row={scope:this.#scope,path,directory:false,data:stored,sha256,base:old?.base??null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:!!old?.conflict};return [row,{path,version:row.version,sha256,status:row.conflict?'conflict':'pending'}];});
     this.#hasPending=true;this.#changed();this.#queueSync();return result;
@@ -247,5 +255,5 @@ export class MirroredFiles{
   }
   async persistence(){return {supported:typeof navigator.storage?.persist==='function'&&typeof navigator.storage?.persisted==='function',persistent:typeof navigator.storage?.persisted==='function'&&await navigator.storage.persisted()===true};}
   async requestPersistence(){need(navigator.userActivation?.isActive,'Use the storage protection button.');need(typeof navigator.storage?.persist==='function','Storage protection is unavailable.');await navigator.storage.persist();return this.persistence();}
-  close(){if(this.#closed)return;this.#closed=true;clearTimeout(this.#timer);globalThis.removeEventListener?.('online',this.#online);globalThis.document?.removeEventListener?.('visibilitychange',this.#visibility);this.#listeners.clear();this.#checked.clear();this.#db?.close();this.#db=null;}
+  close(){if(this.#closed)return;this.#closed=true;this.#captureAbort.abort();clearTimeout(this.#timer);globalThis.removeEventListener?.('online',this.#online);globalThis.document?.removeEventListener?.('visibilitychange',this.#visibility);this.#listeners.clear();this.#checked.clear();this.#db?.close();this.#db=null;}
 }
