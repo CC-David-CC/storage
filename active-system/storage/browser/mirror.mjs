@@ -12,7 +12,11 @@ export function filePath(value){
 export function fileName(value){const name=String(value).trim();need(name&&!name.includes('/')&&filePath('/'+name)==='/'+name,'Enter a valid file name.');return name;}
 const parent=path=>path.slice(0,path.lastIndexOf('/'))||'/';
 const name=path=>path.slice(path.lastIndexOf('/')+1);
-const bytes=value=>typeof value==='string'?new TextEncoder().encode(value):value instanceof Uint8Array?Uint8Array.from(value):value instanceof ArrayBuffer?new Uint8Array(value.slice(0)):null;
+// ArrayBuffer.isView works across iframe realms. Copy synchronously before the
+// first await: callers may mutate their input while the digest is pending.
+const byteArray=value=>ArrayBuffer.isView(value)&&Object.prototype.toString.call(value)==='[object Uint8Array]';
+const rawBuffer=value=>Object.prototype.toString.call(value)==='[object ArrayBuffer]';
+const bytes=value=>typeof value==='string'?new TextEncoder().encode(value):byteArray(value)?new Uint8Array(value):rawBuffer(value)?new Uint8Array(ArrayBuffer.prototype.slice.call(value,0)):null;
 const localQueues=new Map();
 function serializeLocal(key,operation){const previous=localQueues.get(key)??Promise.resolve(),current=previous.catch(()=>{}).then(operation);localQueues.set(key,current);current.finally(()=>{if(localQueues.get(key)===current)localQueues.delete(key);}).catch(()=>{});return current;}
 // Blob values are kept out of IndexedDB's serialized-record size limit. Older
@@ -72,7 +76,11 @@ export class MirroredFiles{
   async stat(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');this.#check();return {bytes:storedSize(r.data),sha256:r.sha256,version:r.version,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
   async read(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');const data=await storedBytes(r.data);this.#check();return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
   async write(path,data,expected=null){
-    path=filePath(path);need(path!=='/','Enter a filename.');const incoming=data instanceof Blob?data:null,copy=incoming?null:bytes(data),size=incoming?incoming.size:copy?.length;need(Number.isSafeInteger(size)&&size<=MAX_FILE,'Files are limited to 128 MiB.');
+    path=filePath(path);need(path!=='/','Enter a filename.');const incoming=data instanceof Blob?data:null;
+    // Reject oversize byte inputs before allocating a snapshot of them.
+    const hint=incoming?incoming.size:byteArray(data)||rawBuffer(data)?data.byteLength:null;
+    if(hint!==null)need(Number.isSafeInteger(hint)&&hint<=MAX_FILE,'Files are limited to 128 MiB.');
+    const copy=incoming?null:bytes(data),size=incoming?incoming.size:copy?.length;need(Number.isSafeInteger(size)&&size<=MAX_FILE,'Files are limited to 128 MiB.');
     // A File from an upload picker can still reference the source on disk even
     // after IndexedDB stores it. Snapshot it before the picker source vanishes.
     // The same bytes are needed for the digest; do not read the input twice.
