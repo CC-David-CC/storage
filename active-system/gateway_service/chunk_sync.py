@@ -51,7 +51,7 @@ class SnapshotLease:
         self.cache._release(self.key,self.item)
 
 class SnapshotCache:
-    def __init__(self,store,maximum_bytes=512*1024*1024,ttl=60,maximum_entries=128,minimum_free_bytes=2*1024*1024*1024,temporary_directory=None):
+    def __init__(self,store,maximum_bytes=1024*1024*1024,ttl=60,maximum_entries=128,minimum_free_bytes=2*1024*1024*1024,temporary_directory=None):
         if type(maximum_bytes) is not int or maximum_bytes<0 or type(maximum_entries) is not int or maximum_entries<1 or type(minimum_free_bytes) is not int or minimum_free_bytes<0:raise ValueError('Invalid cache capacity')
         self.store=store;self.maximum_bytes=maximum_bytes;self.maximum_entries=maximum_entries;self.minimum_free_bytes=minimum_free_bytes;self.temporary_directory=temporary_directory or tempfile.gettempdir();self.ttl=ttl;self.lock=threading.Lock();self.entries=OrderedDict();self.bytes=0;self.reserved=0;self.inflight=0;self.closed=False
     def _free_bytes(self):
