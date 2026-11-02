@@ -219,7 +219,7 @@ export class MirroredFiles{
         if(row.deleted){if(!current){await this.#ack(row,null,{remove:true});continue;}if(current.sha256!==row.base){await this.#conflict(row);continue;}await this.#server.remove(target,row.base);remote.delete(row.path);await this.#ack(row,null,{remove:true});}
         else if(current?.sha256===row.sha256)await this.#ack(row,row.sha256);
         else if((current?.sha256??null)!==row.base)await this.#conflict(row);
-        else{await this.#server.write(target,await storedBytes(row.data),row.base);remote.set(row.path,{directory:false,sha256:row.sha256});await this.#ack(row,row.sha256);}
+        else{await this.#server.write(target,row.data instanceof Blob&&this.#server.acceptsBlobWrites===true?row.data:await storedBytes(row.data),row.base);remote.set(row.path,{directory:false,sha256:row.sha256});await this.#ack(row,row.sha256);}
       }
     }
     // Re-read current local rows: an edit can arrive while the server is slow.

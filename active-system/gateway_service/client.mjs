@@ -58,6 +58,7 @@ export class UserFiles{
     this.config=config;this.session=session;this.valid=sessionValid;this.base=base;this.api=api;
   }
   check(){requireThat(this.valid()&&this.session.public.kind==='registered','Sign in to access your server files');}
+  get acceptsBlobWrites(){return true;}
   async post(path,body,{token=null,headers={},timeout=15000}={}){
     this.check();
     const response=await fetch(path,{method:'POST',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:'no-referrer',
@@ -203,23 +204,26 @@ export class UserFiles{
   async write(path,data,previousSHA256=null,{signal=null}={}){
     const check=()=>{this.check();if(signal?.aborted)throw new DOMException('Cancelled','AbortError')};check();
     if(typeof data==='string')data=new TextEncoder().encode(data);
-    requireThat(data instanceof Uint8Array&&data.length<=MAX_FILE,'Files are limited to 128 MiB');
-    const operation=previousSHA256===null?'create':'replace',snapshot=new Blob([data]);let sha256=null;
-    if(previousSHA256!==null&&data.length>=2*DELTA_BLOCK&&await this.supportsDelta()){
+    requireThat(data instanceof Uint8Array||(data instanceof Blob&&Object.prototype.toString.call(data)==='[object Blob]'),'File bytes or captured Blob required');
+    // Mutable byte arrays are captured synchronously before the first await.
+    // Mirror-owned Blobs are already immutable snapshots and can be reused.
+    const snapshot=data instanceof Blob?data:new Blob([data]),size=snapshot.size;requireThat(size<=MAX_FILE,'Files are limited to 128 MiB');
+    const operation=previousSHA256===null?'create':'replace';let sha256=null;
+    if(previousSHA256!==null&&size>=2*DELTA_BLOCK&&await this.supportsDelta()){
       const signatures=await this.request('delta-signatures',{path,previousSHA256});check();
       requireThat(signatures?.sha256===previousSHA256,'Delta base version changed');
       const result=await runFileWorker('delta',snapshot,check,signal,{signature:signatures});check();
-      requireThat(result&&typeof result.sha256==='string'&&/^[0-9a-f]{64}$/.test(result.sha256)&&(result.patch===null||(result.patch instanceof Blob&&result.patch.size<data.length&&typeof result.patchSHA256==='string'&&/^[0-9a-f]{64}$/.test(result.patchSHA256))),'Invalid delta worker result');
+      requireThat(result&&typeof result.sha256==='string'&&/^[0-9a-f]{64}$/.test(result.sha256)&&(result.patch===null||(result.patch instanceof Blob&&result.patch.size<size&&typeof result.patchSHA256==='string'&&/^[0-9a-f]{64}$/.test(result.patchSHA256))),'Invalid delta worker result');
       sha256=result.sha256;
-      if(result.patch!==null)return this.request('replace-delta',{path,format:'codi-file-delta/1',size:data.length,sha256,previousSHA256,patchSize:result.patch.size,patchSHA256:result.patchSHA256},result.patch);
+      if(result.patch!==null)return this.request('replace-delta',{path,format:'codi-file-delta/1',size:size,sha256,previousSHA256,patchSize:result.patch.size,patchSHA256:result.patchSHA256},result.patch);
     }
     if(await this.supportsStreamingUpload()){
       if(sha256===null)sha256=await runFileWorker('hash',snapshot,check,signal);check();requireThat(typeof sha256==='string'&&/^[0-9a-f]{64}$/.test(sha256),'Invalid file digest');
-      return this.request(operation,{path,format:'codi-binary-upload/1',size:data.length,sha256,...(previousSHA256===null?{}:{previousSHA256})},snapshot);
+      return this.request(operation,{path,format:'codi-binary-upload/1',size:size,sha256,...(previousSHA256===null?{}:{previousSHA256})},snapshot);
     }
     // Legacy JSON fallback still encodes on the main thread; not release-ready
     // for the all-heavy-processing-off-thread goal.
-    return this.request(operation,{path,data:encode(data),...(previousSHA256===null?{}:{previousSHA256})});
+    const legacy=new Uint8Array(await snapshot.arrayBuffer());check();return this.request(operation,{path,data:encode(legacy),...(previousSHA256===null?{}:{previousSHA256})});
   }
   remove(path,previousSHA256=null){return this.request('delete',{path,previousSHA256});}
   rename(path,destination,previousSHA256){return this.request('rename',{path,destination,previousSHA256});}
