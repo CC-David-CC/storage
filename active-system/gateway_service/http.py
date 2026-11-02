@@ -21,7 +21,7 @@ from .auth import MAX_REQUEST_BYTES, Gatekeeper, jose
 from .policy import Denied, exact, parts
 from .transfers import Pacer, Quotas, AllowanceExceeded
 from .user_store import Conflict
-from . import delta
+from . import delta, chunk_sync
 
 MAX_FILE_BYTES=128*1024*1024
 
@@ -161,6 +161,20 @@ class FileGateway:
 
     def _dispatch(self, principal, request):
         operation=request.get('operation')
+        if operation in ('chunk-manifest-v1','chunk-read-v1'):
+            fields=['resource','operation','path','previousSHA256']
+            if operation=='chunk-read-v1':fields+=['offset','length','chunkSHA256']
+            exact(request,fields)
+            version=request['previousSHA256']
+            if request['resource']!='my-files' or not isinstance(version,str) or not re.fullmatch('[0-9a-f]{64}',version):raise Denied('Exact account file version required')
+            path='/'.join(parts(request['path']))
+            if not path:raise Denied('File path required')
+            fd,size,sha256=self.store.open_read_snapshot(principal,path,maximum_bytes=min(MAX_FILE_BYTES,self.store.per_user_bytes))
+            try:
+                if sha256!=version:raise Conflict('File changed before chunk read')
+                if operation=='chunk-manifest-v1':return chunk_sync.manifest(fd,size,sha256)
+                return chunk_sync.read_chunk(fd,size,request['offset'],request['length'],request['chunkSHA256'])
+            finally:os.close(fd)
         if operation=='delta-signatures':
             exact(request,['resource','operation','path','previousSHA256'])
             if request['resource']!='my-files' or not isinstance(request['previousSHA256'],str) or not re.fullmatch('[0-9a-f]{64}',request['previousSHA256']):raise Denied('Exact account file version required')
