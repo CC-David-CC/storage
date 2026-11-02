@@ -74,8 +74,12 @@ export class UserFiles{
       while(true){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>MAX_RESPONSE)throw Error('File response too large');chunks.push(value);}
     }catch(error){await reader.cancel().catch(()=>{});throw error;}
     const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length;}
-    let value;try{value=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));}catch{throw Error('Invalid file service response');}
-    this.check();if(!response.ok)throw new FileRequestError(value.error||'File request failed',response.status);return value;
+    this.check();
+    let value;try{value=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));}catch{
+      if(!response.ok)throw new FileRequestError('File service request failed ('+response.status+')',response.status);
+      throw Error('Invalid file service response');
+    }
+    if(!response.ok)throw new FileRequestError(value?.error||'File request failed',response.status);return value;
   }
   async postBinary(path,body,headers){
     this.check();const response=await fetch(path,{method:'POST',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:'no-referrer',headers:{'Content-Type':'application/json',...headers},body,signal:AbortSignal.timeout(910000)});
