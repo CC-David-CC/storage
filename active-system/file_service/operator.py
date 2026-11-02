@@ -24,6 +24,7 @@ from urllib.parse import quote, urlsplit
 
 WORKER_FILES={*('gateway_service/'+n for n in ['__init__.py','auth.py','policy.py','user_store.py','http.py','transfers.py','client.mjs']),
               'codiserver-server-v0.3.0/codiauth/__init__.py','codiserver-server-v0.3.0/codiauth/jose.py','scripts/serve-user-files.py','requirements.lock'}
+DELTA_WORKER_FILES = WORKER_FILES | {'gateway_service/delta.py'}
 SAFE=re.compile(r'/[A-Za-z0-9_./-]+\Z')
 def digest(raw):return hashlib.sha256(raw).hexdigest()
 def run(args,**kwargs):return subprocess.run(list(map(str,args)),check=True,capture_output=True,text=True,timeout=60,**kwargs).stdout.strip()
@@ -75,13 +76,13 @@ def verify_worker(folder,pin):
     folder=protected(folder,mode=0o755,directory=True);raw=read(folder/'files-service.json',0o644)
     if digest(raw)!=pin:raise ValueError('File worker manifest pin changed')
     value=json.loads(raw)
-    if set(value)!={'version','files'} or value['version']!='codi-private-file-service/1' or set(value['files'])!=WORKER_FILES:raise ValueError('Unexpected file worker manifest')
+    if set(value)!={'version','files'} or value['version']!='codi-private-file-service/1' or set(value['files']) not in (WORKER_FILES,DELTA_WORKER_FILES):raise ValueError('Unexpected file worker manifest')
     found=set()
     for p in folder.rglob('*'):
         if p.is_dir():protected(p,mode=0o755,directory=True);continue
         raw=read(p,0o644,262144);name=str(p.relative_to(folder));found.add(name)
         if name!='files-service.json' and value['files'].get(name)!={'bytes':len(raw),'sha256':digest(raw)}:raise ValueError('Changed/extra file worker input')
-    if found!=WORKER_FILES|{'files-service.json'}:raise ValueError('Missing file worker input')
+    if found!=set(value['files'])|{'files-service.json'}:raise ValueError('Missing file worker input')
 def verify_python(python,release):
     python=Path(python);location(python.parent);venv=protected(python.parent.parent,directory=True)
     if python.name!='python' or python.parent.name!='bin' or not python.is_file():raise ValueError('Explicit installed virtualenv bin/python required')
