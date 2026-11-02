@@ -147,3 +147,22 @@ const fastServer=new Server();fastServer.files.set('class',{directory:true});fas
 const fastRead=fastServer.read.bind(fastServer);fastServer.read=async path=>{fastReads++;return fastRead(path)};fastServer.supportsVersion=async()=>true;fastServer.version=async path=>{fastVersions++;const r=fastServer.files.get(path);return {bytes:r.data.length,sha256:await sha(r.data)}};fastServer.supportsInventoryVersions=async()=>true;fastServer.inventoryVersions=async()=>{fastCalls++;if(fastMode==='incomplete')return {complete:false,entries:[]};if(fastMode==='invalid')return {complete:true,entries:[{path:'class/a.txt',directory:false,bytes:4,sha256:'broken'}]};const r=fastServer.files.get('class/a.txt');return {complete:true,entries:[{path:'class',directory:true},{path:'class/a.txt',directory:false,...(fastMode==='deferred'?{}:{bytes:r.data.length,sha256:await sha(r.data)})}]}};
 const fastMirror=new MirroredFiles({scope:'fast-inventory',server:fastServer,retryMs:0});await fastMirror.sync();assert.equal(fastCalls,1);assert.equal(fastVersions,0);assert.equal(fastReads,1);await fastMirror.sync();assert.equal(fastReads,1,'unchanged file is not downloaded');fastServer.files.get('class/a.txt').data=new TextEncoder().encode('two!');await fastMirror.sync();assert.equal(fastReads,2,'same-size external change is downloaded');assert.equal(new TextDecoder().decode((await fastMirror.read('/class/a.txt')).data),'two!');fastMode='invalid';await assert.rejects(()=>fastMirror.sync(),/inventory/);assert.equal(new TextDecoder().decode((await fastMirror.read('/class/a.txt')).data),'two!','invalid inventory preserves cached files');fastMode='deferred';await fastMirror.sync();assert.equal(fastVersions,1,'deferred hashes use the existing version operation');fastMode='incomplete';await fastMirror.sync();assert.equal((await fastMirror.list('/class')).entries.length,1,'incomplete inventory falls back to ordinary listings');fastMirror.close();
 const noVersion=new Server();noVersion.files.set('note',{directory:false,data:new TextEncoder().encode('abc')});noVersion.supportsInventoryVersions=async()=>true;noVersion.inventoryVersions=async()=>({complete:true,entries:[{path:'note',directory:false,bytes:3,sha256:await sha(noVersion.files.get('note').data)}]});const legacyReader=new MirroredFiles({scope:'inventory-no-version-capability',server:noVersion,retryMs:0});await legacyReader.sync();assert.equal(new TextDecoder().decode((await legacyReader.read('/note')).data),'abc','an inventory hash is never mistaken for file bytes');legacyReader.close();console.log('PASS bounded combined inventory, fallback and same-size external changes');
+
+// Byte snapshots must be independent before write() yields, including views
+// created in another realm. Size rejection precedes the expensive copy.
+const {runInNewContext}=await import('node:vm');
+const snapshotServer=new Server();snapshotServer.offline=true;
+const snapshotFiles=new MirroredFiles({scope:'cross-realm-snapshot',server:snapshotServer,retryMs:0});
+const crossRealm=runInNewContext('new Uint8Array([99, 1, 2, 3, 88])');
+const offsetView=crossRealm.subarray(1,4),pendingSnapshot=snapshotFiles.write('/snapshot.bin',offsetView,null);
+crossRealm.fill(9);await pendingSnapshot;
+assert.deepEqual([...((await snapshotFiles.read('/snapshot.bin')).data)],[1,2,3]);
+const crossBuffer=runInNewContext('new Uint8Array([4,5]).buffer');
+const pendingBuffer=snapshotFiles.write('/buffer.bin',crossBuffer,null);new Uint8Array(crossBuffer).fill(8);await pendingBuffer;
+assert.deepEqual([...((await snapshotFiles.read('/buffer.bin')).data)],[4,5]);
+await snapshotFiles.write('/empty.bin',new Uint8Array(0),null);assert.equal((await snapshotFiles.read('/empty.bin')).data.length,0);
+await assert.rejects(()=>snapshotFiles.write('/too-big.bin',new Uint8Array(128*1024*1024+1),null),/128 MiB/);
+const competing=await Promise.allSettled([snapshotFiles.write('/race.bin',new Uint8Array([1]),null),snapshotFiles.write('/race.bin',new Uint8Array([2]),null)]);
+assert.equal(competing.filter(result=>result.status==='fulfilled').length,1);
+assert.equal(competing.filter(result=>result.status==='rejected').length,1);
+snapshotFiles.close();console.log('PASS cross-realm offset snapshots, mutation, size and write conflicts');
