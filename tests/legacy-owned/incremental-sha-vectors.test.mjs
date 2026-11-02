@@ -1,0 +1,8 @@
+import {readFile} from 'node:fs/promises';import {createHash} from 'node:crypto';import assert from 'node:assert/strict';
+import {sha256} from '../active-system/gateway_service/vendor/js-sha256/core.mjs';
+const s=await readFile(new URL('../active-system/gateway_service/client.mjs',import.meta.url),'utf8');const code=s.slice(s.indexOf('async function hashBlobIncrementally'),s.indexOf('export class UserFiles'));const hashBlob=Function('incrementalSHA256',code+';return hashBlobIncrementally')(sha256);
+for(const n of [0,1,3,55,56,63,64,65,127,128,129,262143,262144,262145,1048579]){const data=Buffer.alloc(n);for(let i=0;i<n;i++)data[i]=(i*71+13)&255;const expected=createHash('sha256').update(data).digest('hex');assert.equal(await hashBlob(new Blob([data])),expected,'length '+n)}
+assert.equal(await hashBlob(new Blob(['abc'])),'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+const block=Buffer.alloc(65536,0xa5),native=createHash('sha256'),stream=sha256.create();for(let i=0;i<2048;i++){native.update(block);stream.update(block)}assert.equal(stream.hex(),native.digest('hex'),'128 MiB streamed vector');
+const old=Blob.prototype.arrayBuffer;let max=0;Blob.prototype.arrayBuffer=function(){max=Math.max(max,this.size);return old.call(this)};try{const big=new Uint8Array(8*1024*1024);assert.equal(await hashBlob(new Blob([big])),createHash('sha256').update(big).digest('hex'));assert.ok(max<=262144,'full-file arrayBuffer allocation') }finally{Blob.prototype.arrayBuffer=old}
+let calls=0;await assert.rejects(hashBlob(new Blob([new Uint8Array(1048576)]),()=>{if(++calls===3)throw Error('cancelled')}),/cancelled/);console.log('PASS incremental SHA vectors, block limits and cancellation');
