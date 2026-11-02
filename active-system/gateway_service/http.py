@@ -173,13 +173,13 @@ class FileGateway:
             path='/'.join(parts(request['path']))
             if not path:raise Denied('File path required')
             maximum=min(MAX_FILE_BYTES,self.store.per_user_bytes)
-            fd,size,description,identity=self.chunk_cache.open(principal,path,version,maximum)
+            lease,size,description,identity=self.chunk_cache.open(principal,path,version,maximum)
             try:
                 if operation=='chunk-manifest-v1':result=description
-                else:result=chunk_sync.read_chunk(fd,size,request['offset'],request['length'],request['chunkSHA256'])
+                else:result=chunk_sync.read_chunk(lease.fd,size,request['offset'],request['length'],request['chunkSHA256'])
                 if self.store.file_identity(principal,path,maximum_bytes=maximum)!=identity:raise Conflict('File changed during chunk read')
                 return result
-            finally:os.close(fd)
+            finally:lease.close()
         if operation=='delta-signatures':
             exact(request,['resource','operation','path','previousSHA256'])
             if request['resource']!='my-files' or not isinstance(request['previousSHA256'],str) or not re.fullmatch('[0-9a-f]{64}',request['previousSHA256']):raise Denied('Exact account file version required')
