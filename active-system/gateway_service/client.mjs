@@ -1,7 +1,6 @@
 /** Account files over same-origin HTTPS. Never sends credentials to another URL. */
 import {hash,signJws,inspectJws,verifyJws,sameKey,validateTimes,nowSeconds,requireThat} from '../network/crypto.mjs';
 import {verifyIdentity,PROOF_TYPE} from '../network/identity.mjs';
-import {sha256 as incrementalSHA256} from './hash/core.mjs';
 
 const MAX_FILE=128*1024*1024,MAX_RESPONSE=192*1024*1024;
 export class FileRequestError extends Error{
@@ -68,24 +67,21 @@ async function makeFileDelta(data,signature,check=()=>{}){
   for(const op of ops){if(op.type==='copy'){output[i++]=67;view.setUint32(i,op.offset);i+=4;view.setUint32(i,op.length);i+=4;}else{output[i++]=73;view.setUint32(i,op.end-op.start);i+=4;output.set(data.subarray(op.start,op.end),i);i+=op.end-op.start;}}
   return output;
 }
-// Content-defined boundaries v1; only the low 16 rolling bits affect cuts.
-let chunkGear;
-async function chunksForBlob(blob,check=()=>{}){
-  if(!chunkGear){const gear=[];for(let i=0;i<256;i++){const prefix=new TextEncoder().encode('codi-chunk-v1:');const input=new Uint8Array(prefix.length+1);input.set(prefix);input[prefix.length]=i;const bytes=new Uint8Array(await crypto.subtle.digest('SHA-256',input));check();gear.push((bytes[6]<<8)|bytes[7]);}chunkGear=gear;}
-  const chunks=[];let rolling=0,start=0,length=0;
-  for(let offset=0;offset<blob.size;offset+=65536){
-    const part=new Uint8Array(await blob.slice(offset,offset+65536).arrayBuffer());check();
-    for(let i=0;i<part.length;i++){rolling=((rolling<<1)+chunkGear[part[i]])&65535;length++;if(length>=262144||(length>=16384&&rolling===0)){const data=blob.slice(start,start+length);const sha256=await hexDigest(await data.arrayBuffer());check();chunks.push({offset:start,length,sha256,data});start+=length;length=0;rolling=0;}}
-    await new Promise(resolve=>setTimeout(resolve,0));check();
-  }
-  if(length){const data=blob.slice(start,start+length);const sha256=await hexDigest(await data.arrayBuffer());check();chunks.push({offset:start,length,sha256,data});}
-  return chunks;
-}
-// Verify a reconstructed file without allocating a second full-size buffer.
-async function hashBlobIncrementally(blob,check=()=>{}){
-  const hasher=incrementalSHA256.create();
-  for(let offset=0;offset<blob.size;offset+=262144){const bytes=new Uint8Array(await blob.slice(offset,offset+262144).arrayBuffer());check();hasher.update(bytes);await new Promise(resolve=>setTimeout(resolve,0));check();}
-  const result=hasher.hex();check();return result;
+// Each file operation owns its worker. Session changes and aborts terminate it.
+async function runFileWorker(operation,blob,check=()=>{},signal=null){
+  check();if(signal?.aborted)throw new DOMException('Cancelled','AbortError');
+  const worker=new Worker(new URL('./hash/verify-worker.mjs',import.meta.url),{type:'module',name:'codi-file-verify'});
+  try{return await new Promise((resolve,reject)=>{
+    let settled=false;const finish=(error,value)=>{if(settled)return;settled=true;clearInterval(timer);signal?.removeEventListener('abort',abort);error?reject(error):resolve(value);};
+    const abort=()=>finish(new DOMException('Cancelled','AbortError'));
+    const timer=setInterval(()=>{try{check()}catch(error){finish(error)}},50);
+    try{
+      signal?.addEventListener('abort',abort,{once:true});
+      worker.onerror=()=>finish(Error('File verification worker failed'));worker.onmessageerror=()=>finish(Error('Invalid verification worker message'));
+      worker.onmessage=event=>{try{check();const data=event.data;if(!data||data.operation!==operation||data.error)throw Error('File verification worker failed');finish(null,data.value)}catch(error){finish(error)}};
+      check();if(signal?.aborted)abort();else worker.postMessage({operation,blob});
+    }catch(error){finish(error)}
+  })}finally{worker.terminate()}
 }
 export class UserFiles{
   constructor(config,session,{sessionValid=()=>true}={}){
@@ -198,19 +194,19 @@ export class UserFiles{
     const result=await this.request('versions',{paths});requireThat(result&&Object.keys(result).length===1&&Array.isArray(result.entries)&&result.entries.length===paths.length,'Invalid file version batch response');
     return result.entries.map((entry,i)=>{requireThat(entry&&entry.path===paths[i],'Invalid file version batch path');if(entry.deferred===true){requireThat(Object.keys(entry).length===2,'Invalid deferred file version');return null;}requireThat(Object.keys(entry).length===3&&Number.isSafeInteger(entry.bytes)&&entry.bytes>=0&&entry.bytes<=MAX_FILE&&typeof entry.sha256==='string'&&/^[0-9a-f]{64}$/.test(entry.sha256),'Invalid file version batch item');return {bytes:entry.bytes,sha256:entry.sha256};});
   }
-  async readChunked(path,expected,previous){
-    this.check();requireThat(previous instanceof Blob&&previous.size<=MAX_FILE&&typeof expected==='string'&&/^[0-9a-f]{64}$/.test(expected),'Invalid chunk read');
-    const cap=await fetch(this.base+'/chunk-capabilities',{method:'GET',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:'no-referrer',signal:AbortSignal.timeout(10000)});this.check();if(cap.status===404)return this.read(path);if(!cap.ok)throw new FileRequestError('Chunk capability unavailable',cap.status);
-    const capText=await cap.text();this.check();requireThat(capText.length<=1024,'Invalid chunk capability');let supported;try{supported=JSON.parse(capText)}catch{throw Error('Invalid chunk capability')}requireThat(supported?.version==='codi-file-chunks/1'&&supported.maxBytes===MAX_FILE,'Invalid chunk capability');
-    const m=await this.request('chunk-manifest-v1',{path,previousSHA256:expected});this.check();
+  async readChunked(path,expected,previous,{signal=null}={}){
+    const check=()=>{this.check();if(signal?.aborted)throw new DOMException('Cancelled','AbortError')};check();requireThat(previous instanceof Blob&&previous.size<=MAX_FILE&&typeof expected==='string'&&/^[0-9a-f]{64}$/.test(expected),'Invalid chunk read');
+    const cap=await fetch(this.base+'/chunk-capabilities',{method:'GET',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:'no-referrer',signal:AbortSignal.timeout(10000)});check();if(cap.status===404)return this.read(path);if(!cap.ok)throw new FileRequestError('Chunk capability unavailable',cap.status);
+    const capText=await cap.text();check();requireThat(capText.length<=1024,'Invalid chunk capability');let supported;try{supported=JSON.parse(capText)}catch{throw Error('Invalid chunk capability')}requireThat(supported?.version==='codi-file-chunks/1'&&supported.maxBytes===MAX_FILE,'Invalid chunk capability');
+    const m=await this.request('chunk-manifest-v1',{path,previousSHA256:expected});check();
     requireThat(m?.version==='codi-file-chunks/1'&&m.sha256===expected&&Number.isSafeInteger(m.size)&&m.size>=0&&m.size<=MAX_FILE&&Array.isArray(m.chunks)&&m.chunks.length<=8193,'Invalid chunk manifest');
-    const local=await chunksForBlob(previous,()=>this.check()),lookup=new Map(local.map(c=>[c.sha256+':'+c.length,c.data]));let position=0;const parts=[];
+    const local=await runFileWorker('chunks',previous,check,signal);check();requireThat(Array.isArray(local)&&local.length<=8193,'Invalid local chunk list');let localOffset=0;const lookup=new Map();for(const c of local){requireThat(Array.isArray(c)&&c.length===3&&c[0]===localOffset&&Number.isSafeInteger(c[1])&&c[1]>0&&c[1]<=262144&&typeof c[2]==='string'&&/^[0-9a-f]{64}$/.test(c[2])&&c[0]+c[1]<=previous.size,'Invalid local chunk');lookup.set(c[2]+':'+c[1],previous.slice(c[0],c[0]+c[1]));localOffset+=c[1]}requireThat(localOffset===previous.size,'Incomplete local chunks');let position=0;const parts=[];
     for(const entry of m.chunks){requireThat(Array.isArray(entry)&&entry.length===3&&entry[0]===position&&Number.isSafeInteger(entry[1])&&entry[1]>0&&entry[1]<=262144&&typeof entry[2]==='string'&&/^[0-9a-f]{64}$/.test(entry[2])&&position+entry[1]<=m.size,'Invalid chunk entry');
       const [offset,length,sha]=entry;let data=lookup.get(sha+':'+length);
-      if(!data){const result=await this.request('chunk-read-v1',{path,previousSHA256:expected,offset,length,chunkSHA256:sha});this.check();requireThat(result?.offset===offset&&result.length===length&&result.sha256===sha&&typeof result.data==='string'&&result.data.length===Math.ceil(length/3)*4,'Invalid chunk response');const bytes=decode(result.data);requireThat(bytes.length===length&&await hexDigest(bytes)===sha,'Chunk integrity check failed');this.check();data=new Blob([bytes]);}
+      if(!data){const result=await this.request('chunk-read-v1',{path,previousSHA256:expected,offset,length,chunkSHA256:sha});check();requireThat(result?.offset===offset&&result.length===length&&result.sha256===sha&&typeof result.data==='string'&&result.data.length===Math.ceil(length/3)*4,'Invalid chunk response');const bytes=decode(result.data);requireThat(bytes.length===length&&await hexDigest(bytes)===sha,'Chunk integrity check failed');check();data=new Blob([bytes]);}
       parts.push(data);position+=length;
     }
-    requireThat(position===m.size,'Incomplete chunk manifest');const blob=new Blob(parts),actual=await hashBlobIncrementally(blob,()=>this.check());this.check();requireThat(actual===expected,'File integrity check failed');return {data:blob,sha256:actual};
+    requireThat(position===m.size,'Incomplete chunk manifest');const blob=new Blob(parts),actual=await runFileWorker('hash',blob,check,signal);check();requireThat(actual===expected,'File integrity check failed');return {data:blob,sha256:actual};
   }
   async read(path){
     this.check();const capability=await fetch(this.base+'/binary-read-capabilities',{method:'GET',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:'no-referrer',signal:AbortSignal.timeout(10000)});this.check();
