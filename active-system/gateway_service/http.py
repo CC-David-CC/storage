@@ -54,6 +54,16 @@ async def offload(function,*args,cancel_result=None,**kwargs):
             elif cancel_result is not None:cancel_result(result)
         finally:raise cancelled
 
+async def finish_transfer(quotas,transfer):
+    """Retry deletion of this finished transfer's slot, never refund usage."""
+    for attempt in range(3):
+        try:
+            await offload(quotas.finish,transfer)
+            return
+        except Exception:
+            if attempt==2:raise
+            await asyncio.sleep(.05 * (attempt+1))
+
 
 class FileGateway:
     def __init__(self, store, issuer_policy, *, base_path='', quotas=None, pacer=None, seconds_per_use=900, idle_seconds=5, upload_idle_seconds=60, max_requests_per_minute=256, max_waiters=128, queue_seconds=5):
@@ -363,7 +373,7 @@ class FileGateway:
                 try:
                     if read_fd is not None:os.close(read_fd)
                 finally:
-                    if transfer:await offload(self.quotas.finish,transfer)
+                    if transfer:await finish_transfer(self.quotas,transfer)
             finally:
                 # A cleanup failure or repeated cancellation must never strand
                 # an admission slot and progressively stop the service.
