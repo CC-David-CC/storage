@@ -27,6 +27,7 @@ WORKER_FILES={*('gateway_service/'+n for n in ['__init__.py','auth.py','policy.p
 DELTA_WORKER_FILES = WORKER_FILES | {'gateway_service/delta.py'}
 CHUNK_WORKER_FILES = DELTA_WORKER_FILES | {'gateway_service/chunk_sync.py'}
 INCREMENTAL_HASH_WORKER_FILES = CHUNK_WORKER_FILES | {'gateway_service/vendor/js-sha256/core.mjs','gateway_service/vendor/js-sha256/shared.mjs','gateway_service/vendor/js-sha256/LICENSE.txt'}
+HASH_WORKER_FILES = INCREMENTAL_HASH_WORKER_FILES | {'gateway_service/vendor/js-sha256/verify-worker.mjs'}
 SAFE=re.compile(r'/[A-Za-z0-9_./-]+\Z')
 def digest(raw):return hashlib.sha256(raw).hexdigest()
 def run(args,**kwargs):return subprocess.run(list(map(str,args)),check=True,capture_output=True,text=True,timeout=60,**kwargs).stdout.strip()
@@ -78,7 +79,10 @@ def verify_worker(folder,pin):
     folder=protected(folder,mode=0o755,directory=True);raw=read(folder/'files-service.json',0o644)
     if digest(raw)!=pin:raise ValueError('File worker manifest pin changed')
     value=json.loads(raw)
-    if set(value)!={'version','files'} or value['version']!='codi-private-file-service/1' or set(value['files']) not in (WORKER_FILES,DELTA_WORKER_FILES,CHUNK_WORKER_FILES,INCREMENTAL_HASH_WORKER_FILES):raise ValueError('Unexpected file worker manifest')
+    if set(value)!={'version','files'} or value['version']!='codi-private-file-service/1' or set(value['files']) not in (WORKER_FILES,DELTA_WORKER_FILES,CHUNK_WORKER_FILES,INCREMENTAL_HASH_WORKER_FILES,HASH_WORKER_FILES):raise ValueError('Unexpected file worker manifest')
+    # Legacy inline-hash inventory is valid only with the known compatible
+    # client; worker-based clients must never install without their worker.
+    if set(value['files'])==INCREMENTAL_HASH_WORKER_FILES and value['files']['gateway_service/client.mjs'].get('sha256')!='d0f49a0db627a7ab265933f8184c9b9e3ebe4168343969e16d947f4d3b426a58':raise ValueError('Worker-based client missing verification worker')
     found=set()
     for p in folder.rglob('*'):
         if p.is_dir():protected(p,mode=0o755,directory=True);continue
