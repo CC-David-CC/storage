@@ -8,6 +8,7 @@ import asyncio
 import base64
 import hashlib
 import io
+import logging
 import os
 import re
 import struct
@@ -55,14 +56,29 @@ async def offload(function,*args,cancel_result=None,**kwargs):
         finally:raise cancelled
 
 async def finish_transfer(quotas,transfer):
-    """Retry deletion of this finished transfer's slot, never refund usage."""
-    for attempt in range(3):
+    """Retry finished-slot cleanup before propagating caller cancellation."""
+    async def retry():
+        for attempt in range(3):
+            try:
+                await offload(quotas.finish,transfer)
+                return
+            except Exception:
+                if attempt==2:raise
+                await asyncio.sleep(.05 * (attempt+1))
+    task=asyncio.create_task(retry());cancelled=None
+    while True:
         try:
-            await offload(quotas.finish,transfer)
-            return
+            await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as error:
+            if task.cancelled():raise
+            cancelled=error
         except Exception:
-            if attempt==2:raise
-            await asyncio.sleep(.05 * (attempt+1))
+            if cancelled:
+                logging.getLogger(__name__).warning('Transfer cleanup failed after cancellation')
+                raise cancelled from None
+            raise
+    if cancelled:raise cancelled
 
 
 class FileGateway:
