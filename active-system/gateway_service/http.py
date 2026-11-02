@@ -21,6 +21,7 @@ from .auth import MAX_REQUEST_BYTES, Gatekeeper, jose
 from .policy import Denied, exact, parts
 from .transfers import Pacer, Quotas, AllowanceExceeded
 from .user_store import Conflict
+from . import delta
 
 MAX_FILE_BYTES=128*1024*1024
 
@@ -29,6 +30,7 @@ class ReadResponse:
     fd: int
     size: int
     sha256: str
+    binary: bool = False
 
 async def offload(function,*args,**kwargs):
     # Keep the admission slot until the actual disk/SQLite work finishes, even
@@ -108,30 +110,55 @@ class FileGateway:
         raw=await self._read(request,principal=principal,deadline=deadline,length=length,idle=self.upload_idle)
         metadata=use.decode(raw)
         operation=metadata.get('operation')
-        exact(metadata,['resource','operation','path','format','size','sha256']+(['previousSHA256'] if operation=='replace' else []))
-        if metadata['resource']!='my-files' or metadata['format']!='codi-binary-upload/1' or operation not in ('create','replace'):
+        is_delta=operation=='replace-delta'
+        expected=['resource','operation','path','format','size','sha256']
+        if operation in ('replace','replace-delta'):expected+=['previousSHA256']
+        if is_delta:expected+=['patchSize','patchSHA256']
+        exact(metadata,expected)
+        if metadata['resource']!='my-files' or operation not in ('create','replace','replace-delta') or metadata['format']!=('codi-file-delta/1' if is_delta else 'codi-binary-upload/1'):
             raise Denied('Unsupported binary upload')
-        size=metadata['size'];digest=metadata['sha256']
-        if type(size) is not int or not 0<=size<=MAX_FILE_BYTES or 4+length+size!=request.content_length:
+        size=metadata['size'];digest=metadata['sha256'];received_size=metadata['patchSize'] if is_delta else size
+        wire_digest=metadata['patchSHA256'] if is_delta else digest
+        if type(size) is not int or not 0<=size<=MAX_FILE_BYTES or type(received_size) is not int or not 0<=received_size<=MAX_FILE_BYTES or 4+length+received_size!=request.content_length:
             raise Denied('Upload size changed')
-        if not isinstance(digest,str) or not re.fullmatch('[0-9a-f]{64}',digest):raise Denied('Upload hash required')
+        if any(not isinstance(value,str) or not re.fullmatch('[0-9a-f]{64}',value) for value in (digest,wire_digest)):
+            raise Denied('Upload hash required')
+        if is_delta and (not isinstance(metadata['previousSHA256'],str) or not re.fullmatch('[0-9a-f]{64}',metadata['previousSHA256'])):raise Denied('Exact previous hash required')
         path='/'.join(parts(metadata['path']))
         if not path:raise Denied('File path required')
         with tempfile.TemporaryFile(mode='w+b') as temporary:
             seen=0;hasher=hashlib.sha256()
-            while seen<size:
+            while seen<received_size:
                 async with asyncio.timeout(min(self.upload_idle,max(.001,deadline-time.monotonic()))):
-                    chunk=await request.content.read(min(self.pacer.burst,size-seen))
+                    chunk=await request.content.read(min(self.pacer.burst,received_size-seen))
                 if not chunk:raise Denied('Truncated upload')
                 await self.pacer.wait(principal.sub,len(chunk),deadline)
                 hasher.update(chunk);seen+=len(chunk)
                 await offload(temporary.write,chunk)
-            if hasher.hexdigest()!=digest:raise Denied('Upload hash changed')
+            if hasher.hexdigest()!=wire_digest:raise Denied('Upload hash changed')
             await offload(temporary.seek,0)
-            return await offload(self.store.put_stream,principal,path,temporary,size,digest,previous_sha256=metadata.get('previousSHA256'))
+            if not is_delta:
+                return await offload(self.store.put_stream,principal,path,temporary,size,digest,previous_sha256=metadata.get('previousSHA256'))
+            fd,base_size,base_hash=await offload(self.store.open_read_snapshot,principal,path,maximum_bytes=min(MAX_FILE_BYTES,self.store.per_user_bytes))
+            try:
+                if base_hash!=metadata['previousSHA256']:raise Conflict('File changed before delta reconstruction')
+                with tempfile.TemporaryFile(mode='w+b') as rebuilt:
+                    await offload(delta.apply_patch,fd,base_size,temporary,received_size,rebuilt,size,digest)
+                    return await offload(self.store.put_stream,principal,path,rebuilt,size,digest,previous_sha256=base_hash)
+            finally:os.close(fd)
 
     def _dispatch(self, principal, request):
         operation=request.get('operation')
+        if operation=='delta-signatures':
+            exact(request,['resource','operation','path','previousSHA256'])
+            if request['resource']!='my-files' or not isinstance(request['previousSHA256'],str) or not re.fullmatch('[0-9a-f]{64}',request['previousSHA256']):raise Denied('Exact account file version required')
+            path='/'.join(parts(request['path']))
+            if not path:raise Denied('File path required')
+            fd,size,sha256=self.store.open_read_snapshot(principal,path,maximum_bytes=min(MAX_FILE_BYTES,self.store.per_user_bytes))
+            try:
+                if sha256!=request['previousSHA256']:raise Conflict('File changed before signature generation')
+                return delta.signatures(fd,size,sha256)
+            finally:os.close(fd)
         if operation=='inventory-versions':
             exact(request,['resource','operation'])
             if request['resource']!='my-files':raise Denied('Personal file resource required')
@@ -146,7 +173,7 @@ class FileGateway:
             return {'entries':self.store.version_batch(principal,request['paths'])}
         common=['resource','operation','path']
         extras={'create':['data'],'replace':['data','previousSHA256'],'delete':['previousSHA256'],'rename':['destination','previousSHA256'],'word-count':['previousSHA256']}
-        if operation not in ('list','read','version','mkdir','create','replace','delete','rename','word-count'):raise Denied('File operation not permitted')
+        if operation not in ('list','read','read-binary','version','mkdir','create','replace','delete','rename','word-count'):raise Denied('File operation not permitted')
         exact(request,common+extras.get(operation,[]))
         if request['resource']!='my-files':raise Denied('Personal file resource required')
         path='/'.join(parts(request['path']))
@@ -157,11 +184,11 @@ class FileGateway:
                 raise Denied('Exact previous content hash required')
         if operation=='word-count':return self.store.word_count(principal,path,request['previousSHA256'])
         if operation=='list':return {'entries':self.store.list(principal,path)}
-        if operation in ('read','version'):
+        if operation in ('read','read-binary','version'):
             fd,size,sha256=self.store.open_read_snapshot(principal,path,maximum_bytes=min(MAX_FILE_BYTES,self.store.per_user_bytes))
             if operation=='version':
                 os.close(fd);return {'bytes':size,'sha256':sha256}
-            return ReadResponse(fd,size,sha256)
+            return ReadResponse(fd,size,sha256,binary=operation=='read-binary')
         if operation in ('create','replace'):
             text=request['data']
             if not isinstance(text,str) or len(text)>((MAX_FILE_BYTES+2)//3)*4:raise Denied('File size limit exceeded')
@@ -187,7 +214,7 @@ class FileGateway:
     async def handle(self, request):
         admitted=False;transfer=None;response=None;read_fd=None
         try:
-            if request.method=='GET' and request.raw_path in ('/gateway/client.mjs','/gateway/capabilities','/gateway/version-batch-capabilities','/gateway/inventory-capabilities','/gateway/inventory-versions-capabilities','/gateway/upload-capabilities','/healthz'):
+            if request.method=='GET' and request.raw_path in ('/gateway/client.mjs','/gateway/capabilities','/gateway/version-batch-capabilities','/gateway/inventory-capabilities','/gateway/inventory-versions-capabilities','/gateway/upload-capabilities','/gateway/delta-capabilities','/gateway/binary-read-capabilities','/healthz'):
                 if request.headers.get('Host')!=self.host:raise web.HTTPForbidden()
                 if request.raw_path=='/healthz':return self._response({'status':'ok','scope':'personal-files'})
                 if request.raw_path=='/gateway/capabilities':return self._response({'version':'codi-file-capabilities/1','fileVersion':True})
@@ -195,6 +222,8 @@ class FileGateway:
                 if request.raw_path=='/gateway/inventory-versions-capabilities':return self._response({'version':'codi-file-inventory-versions/1','maxDirectories':128,'maxEntries':2048,'maxHashedFiles':64,'maxHashBytes':32*1024*1024})
                 if request.raw_path=='/gateway/inventory-capabilities':return self._response({'version':'codi-file-inventory/1','maxDirectories':128,'maxEntries':2048})
                 if request.raw_path=='/gateway/upload-capabilities':return self._response({'version':'codi-binary-upload/1','maxBytes':MAX_FILE_BYTES})
+                if request.raw_path=='/gateway/delta-capabilities':return self._response({'version':'codi-file-delta/1','block':delta.BLOCK,'maxBytes':MAX_FILE_BYTES,'maxOps':delta.MAX_OPS})
+                if request.raw_path=='/gateway/binary-read-capabilities':return self._response({'version':'codi-binary-read/1','maxBytes':MAX_FILE_BYTES})
                 return web.Response(body=self.client_source,content_type='text/javascript',headers={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'})
             self._headers(request);await self._admit();admitted=True
             if request.transport is None or request.transport.is_closing():raise web.HTTPRequestTimeout(text='Client disconnected while waiting')
@@ -226,6 +255,16 @@ class FileGateway:
                     result=await offload(self._dispatch,principal,data)
                     del data
                 if isinstance(result,ReadResponse):
+                    if result.binary:
+                        read_fd=result.fd;length=result.size
+                        await offload(self.quotas.extend,transfer,max(0,length-512))
+                        response=web.StreamResponse(status=200,headers={'Content-Type':'application/octet-stream','Content-Length':str(length),'X-Codi-File-SHA256':result.sha256,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'})
+                        await response.prepare(request);remaining=length
+                        while remaining:
+                            block=await offload(os.read,read_fd,min(self.pacer.burst,remaining))
+                            if not block:raise Denied('File changed while streaming')
+                            await self.pacer.wait(principal.sub,len(block),deadline);await response.write(block);remaining-=len(block)
+                        await response.write_eof();return response
                     # Encode directly to the response in bounded blocks. The old
                     # all-at-once encoding held multiple 170+ MiB copies of a
                     # 128 MiB file and exceeded the live service memory cap.
