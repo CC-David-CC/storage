@@ -33,42 +33,8 @@ function decode(text){
 // Checksums are hints only: the gateway verifies the whole reconstructed file.
 const DELTA_BLOCK=64*1024, DELTA_MOD=65521, DELTA_MAX_OPS=8192, DELTA_MAX_FAILED_HASHES=64;
 const hexDigest=async bytes=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(b=>b.toString(16).padStart(2,'0')).join('');
-async function makeFileDelta(data,signature,check=()=>{}){
-  requireThat(data instanceof Uint8Array&&data.length<=MAX_FILE&&signature?.version==='codi-file-delta/1'&&signature.block===DELTA_BLOCK&&Number.isSafeInteger(signature.size)&&signature.size>=0&&signature.size<=MAX_FILE&&Array.isArray(signature.chunks)&&signature.chunks.length===Math.floor(signature.size/DELTA_BLOCK),'Invalid delta signature');
-  const lookup=new Map();
-  for(let i=0;i<signature.chunks.length;i++){
-    const entry=signature.chunks[i];requireThat(Array.isArray(entry)&&entry.length===2&&Number.isSafeInteger(entry[0])&&entry[0]>=0&&entry[0]<=0xffffffff&&typeof entry[1]==='string'&&/^[0-9a-f]{64}$/.test(entry[1]),'Invalid delta block');
-    let values=lookup.get(entry[0]);if(!values){values=new Map();lookup.set(entry[0],values);}if(!values.has(entry[1]))values.set(entry[1],i*DELTA_BLOCK);
-  }
-  const ops=[];let pos=0,literal=0,a=0,b=0,rolling=false;
-  function copy(offset){const last=ops.at(-1);if(last?.type==='copy'&&last.offset+last.length===offset)last.length+=DELTA_BLOCK;else ops.push({type:'copy',offset,length:DELTA_BLOCK});}
-  function insert(start,end){if(end>start)ops.push({type:'insert',start,end});}
-  let nextYield=0,failedHashes=0;
-  while(pos+DELTA_BLOCK<=data.length){
-    if(pos>=nextYield){await new Promise(resolve=>setTimeout(resolve,0));check();nextYield=pos+256*1024;}
-    if(!rolling){a=1;b=0;for(let i=pos;i<pos+DELTA_BLOCK;i++){a=(a+data[i])%DELTA_MOD;b=(b+a)%DELTA_MOD;}rolling=true;}
-    const candidates=lookup.get((b*65536+a)>>>0);let source;
-    if(candidates){
-      const digest=await hexDigest(data.subarray(pos,pos+DELTA_BLOCK));check();
-      source=candidates.get(digest);
-      // Weak checksums are untrusted hints. Bound expensive collision floods;
-      // successful matching blocks do not consume this budget.
-      if(source===undefined&&++failedHashes>=DELTA_MAX_FAILED_HASHES)return null;
-    }
-    if(source!==undefined){insert(literal,pos);copy(source);pos+=DELTA_BLOCK;literal=pos;rolling=false;if(ops.length>DELTA_MAX_OPS)return null;continue;}
-    if(pos+DELTA_BLOCK===data.length)break;
-    a=(a-data[pos]+data[pos+DELTA_BLOCK]+DELTA_MOD)%DELTA_MOD;
-    b=(b-DELTA_BLOCK*data[pos]+a-1)%DELTA_MOD;if(b<0)b+=DELTA_MOD;
-    pos++;
-  }
-  insert(literal,data.length);if(ops.length>DELTA_MAX_OPS)return null;
-  const total=ops.reduce((n,op)=>n+(op.type==='copy'?9:5+op.end-op.start),0);if(total>=data.length||total>MAX_FILE)return null;
-  const output=new Uint8Array(total),view=new DataView(output.buffer);let i=0;
-  for(const op of ops){if(op.type==='copy'){output[i++]=67;view.setUint32(i,op.offset);i+=4;view.setUint32(i,op.length);i+=4;}else{output[i++]=73;view.setUint32(i,op.end-op.start);i+=4;output.set(data.subarray(op.start,op.end),i);i+=op.end-op.start;}}
-  return output;
-}
 // Each file operation owns its worker. Session changes and aborts terminate it.
-async function runFileWorker(operation,blob,check=()=>{},signal=null){
+async function runFileWorker(operation,blob,check=()=>{},signal=null,extra={}){
   check();if(signal?.aborted)throw new DOMException('Cancelled','AbortError');
   const worker=new Worker(new URL('./hash/verify-worker.mjs',import.meta.url),{type:'module',name:'codi-file-verify'});
   try{return await new Promise((resolve,reject)=>{
@@ -79,7 +45,7 @@ async function runFileWorker(operation,blob,check=()=>{},signal=null){
       signal?.addEventListener('abort',abort,{once:true});
       worker.onerror=()=>finish(Error('File verification worker failed'));worker.onmessageerror=()=>finish(Error('Invalid verification worker message'));
       worker.onmessage=event=>{try{check();const data=event.data;if(!data||data.operation!==operation||data.error)throw Error('File verification worker failed');finish(null,data.value)}catch(error){finish(error)}};
-      check();if(signal?.aborted)abort();else worker.postMessage({operation,blob});
+      check();if(signal?.aborted)abort();else worker.postMessage({...extra,operation,blob});
     }catch(error){finish(error)}
   })}finally{worker.terminate()}
 }
@@ -138,7 +104,7 @@ export class UserFiles{
     const proof=await signJws({v:1,iss:sid,aud:audience,nonce:challenge.nonce,grant_sha256:await hash(result.confirmation),request_sha256:requestSha,method:'POST',path:this.base+'/use',iat:c.iat,exp:c.exp},key,'codi-gateway-use+jws');
     const authorization='Codi-File '+result.confirmation+' '+proof;
     if(binary!==null){
-      requireThat(binary instanceof Uint8Array&&binary.length<=MAX_FILE,'Invalid binary upload');
+      requireThat((binary instanceof Uint8Array&&binary.length<=MAX_FILE)||(binary instanceof Blob&&binary.size<=MAX_FILE),'Invalid binary upload');
       const metadata=new TextEncoder().encode(raw);requireThat(metadata.length<=8192,'Upload metadata too large');
       const prefix=new Uint8Array(4);new DataView(prefix.buffer).setUint32(0,metadata.length,false);
       const body=new Blob([prefix,metadata,binary],{type:'application/octet-stream'});
@@ -234,23 +200,25 @@ export class UserFiles{
     const text=await response.text();requireThat(text.length<=1024,'Invalid delta capabilities');let result;try{result=JSON.parse(text)}catch{throw Error('Invalid delta capabilities')}
     return !!(result&&Object.keys(result).length===4&&result.version==='codi-file-delta/1'&&result.block===DELTA_BLOCK&&result.maxBytes===MAX_FILE&&result.maxOps===DELTA_MAX_OPS);
   }
-  async write(path,data,previousSHA256=null){
+  async write(path,data,previousSHA256=null,{signal=null}={}){
+    const check=()=>{this.check();if(signal?.aborted)throw new DOMException('Cancelled','AbortError')};check();
     if(typeof data==='string')data=new TextEncoder().encode(data);
     requireThat(data instanceof Uint8Array&&data.length<=MAX_FILE,'Files are limited to 128 MiB');
-    const operation=previousSHA256===null?'create':'replace';
+    const operation=previousSHA256===null?'create':'replace',snapshot=new Blob([data]);let sha256=null;
     if(previousSHA256!==null&&data.length>=2*DELTA_BLOCK&&await this.supportsDelta()){
-      const signatures=await this.request('delta-signatures',{path,previousSHA256});
+      const signatures=await this.request('delta-signatures',{path,previousSHA256});check();
       requireThat(signatures?.sha256===previousSHA256,'Delta base version changed');
-      const patch=await makeFileDelta(data,signatures,()=>this.check());this.check();
-      if(patch!==null){
-        const sha256=await hexDigest(data);this.check();const patchSHA256=await hexDigest(patch);this.check();
-        return this.request('replace-delta',{path,format:'codi-file-delta/1',size:data.length,sha256,previousSHA256,patchSize:patch.length,patchSHA256},patch);
-      }
+      const result=await runFileWorker('delta',snapshot,check,signal,{signature:signatures});check();
+      requireThat(result&&typeof result.sha256==='string'&&/^[0-9a-f]{64}$/.test(result.sha256)&&(result.patch===null||(result.patch instanceof Blob&&result.patch.size<data.length&&typeof result.patchSHA256==='string'&&/^[0-9a-f]{64}$/.test(result.patchSHA256))),'Invalid delta worker result');
+      sha256=result.sha256;
+      if(result.patch!==null)return this.request('replace-delta',{path,format:'codi-file-delta/1',size:data.length,sha256,previousSHA256,patchSize:result.patch.size,patchSHA256:result.patchSHA256},result.patch);
     }
     if(await this.supportsStreamingUpload()){
-      const sha256=await hexDigest(data);this.check();
-      return this.request(operation,{path,format:'codi-binary-upload/1',size:data.length,sha256,...(previousSHA256===null?{}:{previousSHA256})},data);
+      if(sha256===null)sha256=await runFileWorker('hash',snapshot,check,signal);check();requireThat(typeof sha256==='string'&&/^[0-9a-f]{64}$/.test(sha256),'Invalid file digest');
+      return this.request(operation,{path,format:'codi-binary-upload/1',size:data.length,sha256,...(previousSHA256===null?{}:{previousSHA256})},snapshot);
     }
+    // Legacy JSON fallback still encodes on the main thread; not release-ready
+    // for the all-heavy-processing-off-thread goal.
     return this.request(operation,{path,data:encode(data),...(previousSHA256===null?{}:{previousSHA256})});
   }
   remove(path,previousSHA256=null){return this.request('delete',{path,previousSHA256});}
