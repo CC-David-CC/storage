@@ -1018,6 +1018,9 @@ class UserStore:
                 else:
                     if existing['sha256'] != row[5]:
                         raise Conflict('Report destination changed; no file was overwritten')
+                # A matching report may have been published by an earlier call.
+                # Later errors cannot truthfully be reported as a refusal.
+                _mark_mutated()
                 phase('published')
                 db.execute('UPDATE reports SET completed=1 WHERE id=?', (operation_id,))
                 _mark_mutated()
