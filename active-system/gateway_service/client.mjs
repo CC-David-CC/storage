@@ -31,7 +31,7 @@ function decode(text){
 }
 // Rolling checksums locate shifted 64 KiB blocks; SHA-256 confirms each match.
 // Checksums are hints only: the gateway verifies the whole reconstructed file.
-const DELTA_BLOCK=64*1024, DELTA_MOD=65521, DELTA_MAX_OPS=8192;
+const DELTA_BLOCK=64*1024, DELTA_MOD=65521, DELTA_MAX_OPS=8192, DELTA_MAX_FAILED_HASHES=64;
 const hexDigest=async bytes=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(b=>b.toString(16).padStart(2,'0')).join('');
 async function makeFileDelta(data,signature,check=()=>{}){
   requireThat(data instanceof Uint8Array&&data.length<=MAX_FILE&&signature?.version==='codi-file-delta/1'&&signature.block===DELTA_BLOCK&&Number.isSafeInteger(signature.size)&&signature.size>=0&&signature.size<=MAX_FILE&&Array.isArray(signature.chunks)&&signature.chunks.length===Math.floor(signature.size/DELTA_BLOCK),'Invalid delta signature');
@@ -43,12 +43,18 @@ async function makeFileDelta(data,signature,check=()=>{}){
   const ops=[];let pos=0,literal=0,a=0,b=0,rolling=false;
   function copy(offset){const last=ops.at(-1);if(last?.type==='copy'&&last.offset+last.length===offset)last.length+=DELTA_BLOCK;else ops.push({type:'copy',offset,length:DELTA_BLOCK});}
   function insert(start,end){if(end>start)ops.push({type:'insert',start,end});}
-  let nextYield=0;
+  let nextYield=0,failedHashes=0;
   while(pos+DELTA_BLOCK<=data.length){
     if(pos>=nextYield){await new Promise(resolve=>setTimeout(resolve,0));check();nextYield=pos+256*1024;}
     if(!rolling){a=1;b=0;for(let i=pos;i<pos+DELTA_BLOCK;i++){a=(a+data[i])%DELTA_MOD;b=(b+a)%DELTA_MOD;}rolling=true;}
     const candidates=lookup.get((b*65536+a)>>>0);let source;
-    if(candidates)source=candidates.get(await hexDigest(data.subarray(pos,pos+DELTA_BLOCK)));
+    if(candidates){
+      const digest=await hexDigest(data.subarray(pos,pos+DELTA_BLOCK));check();
+      source=candidates.get(digest);
+      // Weak checksums are untrusted hints. Bound expensive collision floods;
+      // successful matching blocks do not consume this budget.
+      if(source===undefined&&++failedHashes>=DELTA_MAX_FAILED_HASHES)return null;
+    }
     if(source!==undefined){insert(literal,pos);copy(source);pos+=DELTA_BLOCK;literal=pos;rolling=false;if(ops.length>DELTA_MAX_OPS)return null;continue;}
     if(pos+DELTA_BLOCK===data.length)break;
     a=(a-data[pos]+data[pos+DELTA_BLOCK]+DELTA_MOD)%DELTA_MOD;
@@ -207,12 +213,12 @@ export class UserFiles{
       requireThat(signatures?.sha256===previousSHA256,'Delta base version changed');
       const patch=await makeFileDelta(data,signatures,()=>this.check());this.check();
       if(patch!==null){
-        const sha256=await hexDigest(data),patchSHA256=await hexDigest(patch);this.check();
+        const sha256=await hexDigest(data);this.check();const patchSHA256=await hexDigest(patch);this.check();
         return this.request('replace-delta',{path,format:'codi-file-delta/1',size:data.length,sha256,previousSHA256,patchSize:patch.length,patchSHA256},patch);
       }
     }
     if(await this.supportsStreamingUpload()){
-      const sha256=await hexDigest(data);
+      const sha256=await hexDigest(data);this.check();
       return this.request(operation,{path,format:'codi-binary-upload/1',size:data.length,sha256,...(previousSHA256===null?{}:{previousSHA256})},data);
     }
     return this.request(operation,{path,data:encode(data),...(previousSHA256===null?{}:{previousSHA256})});
