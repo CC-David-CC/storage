@@ -76,6 +76,14 @@ export class MirroredFiles{
   async status(){const all=await this.#all();return {pending:all.filter(r=>r.dirty&&!r.conflict).length,conflicts:all.filter(r=>r.conflict).length,error:this.#lastError,lastSynced:this.#lastSynced};}
   async stat(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');this.#check();return {bytes:storedSize(r.data),sha256:r.sha256,version:r.version,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
   async read(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');const data=await storedBytes(r.data);this.#check();return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
+  // Size-check the exact IDB record before reading Blob bytes. Legacy records
+  // stored as ArrayBuffer may already have been cloned by IndexedDB's get().
+  async readBounded(path,maximumBytes){
+    path=filePath(path);need(Number.isSafeInteger(maximumBytes)&&maximumBytes>=0&&maximumBytes<=MAX_FILE,'Invalid read size limit.');
+    const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');
+    need(storedSize(r.data)<=maximumBytes,'This file exceeds the allowed size.');
+    const data=await storedBytes(r.data);this.#check();return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};
+  }
   async write(path,data,expected=null){
     path=filePath(path);need(path!=='/','Enter a filename.');const incoming=blobValue(data)?data:null;
     // Reject oversize byte inputs before allocating a snapshot of them.
