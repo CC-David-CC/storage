@@ -1,3 +1,4 @@
+import {isContentRef} from './verified-content.mjs';
 /** Account-scoped local-first file mirror. The server client performs signed,
  * authorized operations; this module never sends a file to another origin. */
 const MAX_FILE=128*1024*1024, MAX_ENTRIES=4096;
@@ -28,17 +29,16 @@ function serializeLocal(key,operation,signal){
 }
 // Blob values are kept out of IndexedDB's serialized-record size limit. Older
 // records contain ArrayBuffers; retain read/sync compatibility with them.
-const storedSize=value=>value instanceof Blob?value.size:value.byteLength;
-const storedBytes=async value=>new Uint8Array(value instanceof Blob?await value.arrayBuffer():value.slice(0));
+const storedSize=value=>isContentRef(value)?value.size:value instanceof Blob?value.size:value.byteLength;
 async function digest(value){return [...new Uint8Array(await crypto.subtle.digest('SHA-256',value))].map(b=>b.toString(16).padStart(2,'0')).join('');}
 export class MirrorConflict extends Error{constructor(message='This file changed on another device. Choose which copy to keep.'){super(message);this.name='MirrorConflict';}}
 export class MirrorCommitUncertain extends Error{constructor(){super('Account changed after a local storage transaction committed. Reopen the original account and check the file before retrying.');this.name='MirrorCommitUncertain';}}
 export class MirroredFiles{
-  #scope;#server;#valid;#captureAbort=new AbortController();#db;#opening;#running;#closed=false;#listeners=new Set();#timer;#retryMs;#rateFailures=0;#online;#visibility;#hasPending=true;#again=false;#lastError=null;#lastSynced=null;#checked=new Map();
-  constructor({scope,server,valid=()=>true,onChange=()=>{},retryMs=15000}={}){
+  #scope;#server;#content;#valid;#captureAbort=new AbortController();#db;#opening;#running;#closed=false;#listeners=new Set();#timer;#retryMs;#rateFailures=0;#online;#visibility;#hasPending=true;#again=false;#lastError=null;#lastSynced=null;#checked=new Map();
+  constructor({scope,server,content=null,valid=()=>true,onChange=()=>{},retryMs=15000}={}){
     need(typeof scope==='string'&&scope.length>0&&scope.length<=512&&server&&typeof valid==='function'&&typeof onChange==='function','Authenticated file mirror required.');
     need(typeof retryMs==='number'&&Number.isFinite(retryMs)&&retryMs>=0,'Invalid sync retry interval.');
-    this.#scope=scope;this.#server=server;this.#valid=valid;this.#retryMs=retryMs;this.#listeners.add(onChange);
+    this.#scope=scope;this.#server=server;this.#content=content;this.#valid=valid;this.#retryMs=retryMs;this.#listeners.add(onChange);
     this.#online=()=>{if(!this.#running)this.#queueSync();};globalThis.addEventListener?.('online',this.#online);
     this.#visibility=()=>{if(this.#closed||!this.#retryMs)return;if(globalThis.document?.visibilityState==='visible'&&this.#lastSynced!==null&&Date.now()-this.#lastSynced>=this.#retryMs*2&&!this.#running&&globalThis.navigator?.onLine!==false)this.#queueSync();else this.#schedule();};globalThis.document?.addEventListener?.('visibilitychange',this.#visibility);
     this.#schedule();
@@ -73,26 +73,40 @@ export class MirroredFiles{
     });
   }
   async #all(){return this.#tx('readonly',(store,done,fail)=>{const request=store.index('scope').getAll(this.#scope);request.onsuccess=()=>done(request.result);request.onerror=()=>fail(request.error);});}
-  async #get(path){return this.#tx('readonly',(store,done,fail)=>{const request=store.get([this.#scope,path]);request.onsuccess=()=>done(request.result||null);request.onerror=()=>fail(request.error);});}
+  async #get(path){const row=await this.#tx('readonly',(store,done,fail)=>{const request=store.get([this.#scope,path]);request.onsuccess=()=>done(request.result||null);request.onerror=()=>fail(request.error);});if(isContentRef(row?.data))need(row.sha256===row.data.sha256,'Stored content metadata is inconsistent.');return row;}
   async #update(path,fn){return this.#tx('readwrite',(store,done,fail)=>{const request=store.get([this.#scope,path]);request.onsuccess=()=>{try{this.#check();const [next,result]=fn(request.result||null);if(next===null)store.delete([this.#scope,path]);else if(next!==undefined)store.put(next);done(result);}catch(e){fail(e);}};request.onerror=()=>fail(request.error);});}
   // Validate hierarchy and write within one IndexedDB transaction across tabs.
   async #mutate(path,fn){return this.#tx('readwrite',(store,done,fail)=>{const request=store.index('scope').getAll(this.#scope);request.onsuccess=()=>{try{this.#check();const all=request.result,old=all.find(r=>r.path===path)||null;const [next,result]=fn(old,all);if(next===null)store.delete([this.#scope,path]);else if(next!==undefined)store.put(next);done(result);}catch(e){fail(e);}};request.onerror=()=>fail(request.error);});}
+  async #blob(value){
+    if(isContentRef(value)){need(this.#content&&typeof this.#content.read==='function','This browser needs the updated file storage.');const blob=await this.#content.read(value);this.#check();need(blob instanceof Blob&&blob.size===value.size,'Stored content is unavailable.');return blob;}
+    need(blobValue(value)||rawBuffer(value),'Invalid stored content.');return value instanceof Blob?value:new Blob([value]);
+  }
+  // Explicit opt-in migration: preserve the entire legacy row, including
+  // attempt/conflict metadata, and publish the reference only via CAS.
+  async migrateContent(path,expected){
+    path=filePath(path);need(this.#content&&typeof this.#content.capture==='function'&&typeof expected==='string','Verified storage is unavailable.');
+    const row=await this.#get(path);need(row&&!row.deleted&&!row.directory&&row.version===expected,'File changed; reload before migrating.');
+    if(isContentRef(row.data))return false;
+    const ref=await this.#content.capture(await this.#blob(row.data));this.#check();
+    need(isContentRef(ref)&&ref.size===storedSize(row.data)&&ref.sha256===row.sha256,'Saved content did not pass verification.');
+    return this.#update(path,current=>{if(!current||current.version!==expected||current.sha256!==row.sha256||current.deleted||current.directory||isContentRef(current.data))throw new MirrorConflict();return [{...current,data:ref},true];});
+  }
   async list(path='/'){
     path=filePath(path);const all=await this.#all();if(path!=='/'){const dir=all.find(r=>r.path===path&&!r.deleted);need(dir?.directory,'Folder not found.');}
     return {entries:all.filter(r=>(!r.deleted||r.conflict)&&parent(r.path)===path).sort((a,b)=>a.path.localeCompare(b.path)).map(r=>({path:r.path,name:name(r.path),directory:r.directory,bytes:r.directory?null:storedSize(r.data),version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced',canMove:!r.directory&&!r.deleted&&!r.conflict&&!r.moving&&!r.attempted&&((!r.dirty&&typeof r.base==='string')||(r.dirty&&r.base===null)),canReceiveMove:r.directory&&!r.deleted&&!r.conflict&&!r.moving&&((!r.dirty&&r.base==='dir')||(r.dirty&&r.base===null))}))};
   }
   async status(){const all=await this.#all();return {pending:all.filter(r=>r.dirty&&!r.conflict).length,conflicts:all.filter(r=>r.conflict).length,error:this.#lastError,lastSynced:this.#lastSynced};}
   async stat(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');this.#check();return {bytes:storedSize(r.data),sha256:r.sha256,version:r.version,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
-  async read(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');const data=await storedBytes(r.data);this.#check();return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
+  async read(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');const data=new Uint8Array(await (await this.#blob(r.data)).arrayBuffer());this.#check();return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
   // Immutable snapshot for consumers that can use Blob.slice() or stream().
-  async readBlob(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');const data=r.data instanceof Blob?r.data:new Blob([r.data]);this.#check();return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
+  async readBlob(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');const data=await this.#blob(r.data);this.#check();return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
   // Size-check the exact IDB record before reading Blob bytes. Legacy records
   // stored as ArrayBuffer may already have been cloned by IndexedDB's get().
   async readBounded(path,maximumBytes){
     path=filePath(path);need(Number.isSafeInteger(maximumBytes)&&maximumBytes>=0&&maximumBytes<=MAX_FILE,'Invalid read size limit.');
     const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');
     need(storedSize(r.data)<=maximumBytes,'This file exceeds the allowed size.');
-    const data=await storedBytes(r.data);this.#check();return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};
+    const data=new Uint8Array(await (await this.#blob(r.data)).arrayBuffer());this.#check();return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};
   }
   async write(path,data,expected=null){
     this.#check();const stopValidity=this.#watchValidity();try{
@@ -107,7 +121,9 @@ export class MirroredFiles{
     // an external writer can still race browser file APIs, so do not claim
     // this is an OS-level atomic snapshot.
     let stored,sha256;
-    if(typeof this.#server.captureSnapshot==='function'){
+    if(this.#content){
+      const ref=await this.#content.capture(incoming||new Blob([copy]));this.#check();need(isContentRef(ref)&&ref.size===size,'Invalid file capture.');stored=ref;sha256=ref.sha256;
+    }else if(typeof this.#server.captureSnapshot==='function'){
       const source=incoming||new Blob([copy]);const result=await this.#server.captureSnapshot(source,{signal:this.#captureAbort.signal});this.#check();
       need(result?.blob instanceof Blob&&result.blob.size===size&&typeof result.sha256==='string'&&/^[0-9a-f]{64}$/.test(result.sha256),'Invalid file capture.');stored=result.blob;sha256=result.sha256;
     }else{
@@ -251,7 +267,7 @@ export class MirroredFiles{
     if(rows.some(r=>r.moving)){remote=await this.#remoteInventory();rows=await this.#all();}
     // Create parents before children; remove children before parents.
     const dirty=rows.filter(r=>r.dirty&&!r.conflict&&!r.moving).sort((a,b)=>(a.deleted?1:0)-(b.deleted?1:0)||(a.deleted?b.path.length-a.path.length:a.path.length-b.path.length));
-    for(let index=0;index<dirty.length;index++){let row=dirty[index];this.#check();const existing=remote.get(row.path),target=row.path.slice(1);
+    for(let index=0;index<dirty.length;index++){let row=dirty[index];this.#check();if(isContentRef(row.data))need(row.sha256===row.data.sha256,'Stored content metadata is inconsistent.');const existing=remote.get(row.path),target=row.path.slice(1);
       // Updating existing files needs their server versions. Fetch a bounded
       // group together; the eventual write/delete still enforces its base hash.
       if(canBatch&&!row.directory&&existing&&!existing.directory&&!existing.sha256&&!batchCache.has(target)){
@@ -274,7 +290,7 @@ export class MirroredFiles{
         else if((current?.sha256??null)!==row.base)await this.#conflict(row);
         else{
           if(!await this.#rememberAttempt(row)){this.#again=true;continue;}
-          this.#check();await this.#server.write(target,row.data instanceof Blob&&this.#server.acceptsBlobWrites===true?row.data:await storedBytes(row.data),row.base,{signal:this.#captureAbort.signal});remote.set(row.path,{directory:false,sha256:row.sha256});await this.#ack(row,row.sha256);
+          this.#check();await this.#server.write(target,this.#server.acceptsBlobWrites===true?await this.#blob(row.data):new Uint8Array(await (await this.#blob(row.data)).arrayBuffer()),row.base,{signal:this.#captureAbort.signal});remote.set(row.path,{directory:false,sha256:row.sha256});await this.#ack(row,row.sha256);
         }
       }
     }
@@ -288,7 +304,7 @@ export class MirroredFiles{
       // changes the row version and invalidates the entry. The next complete
       // scan starts fresh, so external edits are still eventually discovered.
       if(row&&this.#checked.get(path)===row.version)continue;
-      let value;try{if(canBatch&&!item.sha256&&!batchCache.has(path.slice(1))){const paths=[];let bytes=0;for(let i=index;i<entries.length&&paths.length<16;i++){const [other,record]=entries[i],r=local.get(other),relative=other.slice(1),length=new TextEncoder().encode(relative).length;if(record.directory||record.sha256||r?.dirty||(r&&this.#checked.get(other)===r.version)||batchCache.has(relative))continue;if(bytes+length>8192)break;paths.push(relative);bytes+=length;}if(paths.length){const values=await this.#server.versions(paths,{signal:this.#captureAbort.signal});this.#check();need(Array.isArray(values)&&values.length===paths.length,'Invalid batch file versions.');for(let i=0;i<paths.length;i++)batchCache.set(paths[i],values[i]);}}value=await version(path.slice(1),item);if(!row||row.sha256!==value.sha256){if(!('data' in value))value=row?.data instanceof Blob&&typeof this.#server.readChunked==='function'?await this.#server.readChunked(path.slice(1),value.sha256,row.data,{signal:this.#captureAbort.signal}):!row&&typeof this.#server.readBlob==='function'?await this.#server.readBlob(path.slice(1),value.sha256,{signal:this.#captureAbort.signal}):await this.#server.read(path.slice(1),{signal:this.#captureAbort.signal});this.#check();await this.#install({path,version:row?.version??null},{directory:false,data:new Blob([value.data]),sha256:value.sha256});}const current=await this.#get(path);if(current&&!current.dirty&&!current.directory&&current.sha256===value.sha256)this.#checked.set(path,current.version);}catch(error){if(error?.status===429)throw error;issues.push('Could not sync '+path+': '+(error.message||'server file unavailable'));continue;}
+      let value;try{if(canBatch&&!item.sha256&&!batchCache.has(path.slice(1))){const paths=[];let bytes=0;for(let i=index;i<entries.length&&paths.length<16;i++){const [other,record]=entries[i],r=local.get(other),relative=other.slice(1),length=new TextEncoder().encode(relative).length;if(record.directory||record.sha256||r?.dirty||(r&&this.#checked.get(other)===r.version)||batchCache.has(relative))continue;if(bytes+length>8192)break;paths.push(relative);bytes+=length;}if(paths.length){const values=await this.#server.versions(paths,{signal:this.#captureAbort.signal});this.#check();need(Array.isArray(values)&&values.length===paths.length,'Invalid batch file versions.');for(let i=0;i<paths.length;i++)batchCache.set(paths[i],values[i]);}}value=await version(path.slice(1),item);if(!row||row.sha256!==value.sha256){if(!('data' in value))value=row?.data&&(row.data instanceof Blob||isContentRef(row.data))&&typeof this.#server.readChunked==='function'?await this.#server.readChunked(path.slice(1),value.sha256,await this.#blob(row.data),{signal:this.#captureAbort.signal}):!row&&typeof this.#server.readBlob==='function'?await this.#server.readBlob(path.slice(1),value.sha256,{signal:this.#captureAbort.signal}):await this.#server.read(path.slice(1),{signal:this.#captureAbort.signal});this.#check();await this.#install({path,version:row?.version??null},{directory:false,data:new Blob([value.data]),sha256:value.sha256});}const current=await this.#get(path);if(current&&!current.dirty&&!current.directory&&current.sha256===value.sha256)this.#checked.set(path,current.version);}catch(error){if(error?.status===429)throw error;issues.push('Could not sync '+path+': '+(error.message||'server file unavailable'));continue;}
     }
     for(const row of fresh){if(row.dirty||remote.has(row.path))continue;if(row.directory&&fresh.some(child=>child.dirty&&child.path.startsWith(row.path+'/')))continue;await this.#update(row.path,current=>current&&!current.dirty&&current.version===row.version?[null,true]:[undefined,false]);}
     this.#changed();if(issues.length)throw Error(issues[0]+(issues.length>1?' (and '+(issues.length-1)+' other files)':''));this.#checked.clear();const remaining=await this.#all();this.#hasPending=remaining.some(r=>r.dirty&&!r.conflict);return {pending:remaining.filter(r=>r.dirty).length};
