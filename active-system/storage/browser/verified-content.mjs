@@ -4,16 +4,26 @@ import {OPFSStore,StorageUnavailable} from './opfs/store.mjs';
 // gets a new OPFS record; the mirror row is the only authority for its use.
 // Published OPFS records are deliberately retained until safe GC is designed.
 export class VerifiedContent {
-  #store;#scope;#lockWaitMs;#closed=false;#abort=new AbortController();
-  constructor(scope,options={}) { this.#scope=scope;this.#lockWaitMs=options.lockWaitMs??30000;this.#store=new OPFSStore(scope,options); }
+  #store;#scope;#lockWaitMs;#workerWaitMs;#closed=false;#abort=new AbortController();
+  constructor(scope,options={}) { this.#scope=scope;this.#lockWaitMs=options.lockWaitMs??30000;this.#workerWaitMs=options.workerWaitMs??180000;if(!Number.isSafeInteger(this.#workerWaitMs)||this.#workerWaitMs<10||this.#workerWaitMs>180000)throw Error('Invalid worker queue timeout');this.#store=new OPFSStore(scope,options); }
+  // One heavy content worker across cooperating same-origin contexts. Web Locks
+  // provides cross-tab FIFO admission and releases the slot on page death.
+  async #admit(operation,signal=null) {
+    if(this.#closed||signal?.aborted)throw new DOMException('Cancelled','AbortError');
+    if(!navigator.locks)throw new StorageUnavailable('locks-unavailable');
+    const deadline=AbortSignal.timeout(this.#workerWaitMs),combined=AbortSignal.any([this.#abort.signal,deadline,...(signal?[signal]:[])]);
+    let acquired=false;
+    try{return await navigator.locks.request('codi-file-heavy-worker/1',{mode:'exclusive',signal:combined},async()=>{acquired=true;if(this.#closed||signal?.aborted)throw new DOMException('Cancelled','AbortError');return operation()});}
+    catch(error){if(!acquired&&deadline.aborted&&!this.#abort.signal.aborted&&!signal?.aborted)throw new StorageUnavailable('worker-queue-timeout');throw error;}
+  }
   async capture(blob) {
     if (!['[object Blob]','[object File]'].includes(Object.prototype.toString.call(blob))) throw Error('A file snapshot is required.');
-    blob=new Blob([blob]);
-    const path='/content-'+crypto.randomUUID();
-    const saved=await this.#store.save(path,blob,null,{owner:'codi-mirror-content/1'});
-    return {kind:'codi-opfs-content/1',path,generation:saved.generation,size:saved.size,sha256:saved.sha256};
+    if(!Number.isSafeInteger(blob.size)||blob.size<0||blob.size>128*1024*1024)throw Error('Files are limited to 128 MiB.');
+    return this.#admit(async()=>{const source=new Blob([blob]),path='/content-'+crypto.randomUUID();
+      const saved=await this.#store.save(path,source,null,{owner:'codi-mirror-content/1'});
+      return {kind:'codi-opfs-content/1',path,generation:saved.generation,size:saved.size,sha256:saved.sha256};});
   }
-  async verifyLegacy(blob,expected,{signal=null}={}) { return this.#store.verifyBlob(blob,expected,{signal}); }
+  async verifyLegacy(blob,expected,{signal=null}={}) { return this.#admit(()=>this.#store.verifyBlob(blob,expected,{signal}),signal); }
   async acquire(ref,{signal=null}={}) {
     if(!isContentRef(ref))throw Error('Invalid content reference.');
     if(this.#closed||signal?.aborted)throw new DOMException('Cancelled','AbortError');
@@ -28,7 +38,7 @@ export class VerifiedContent {
       let offered=false,acquired=false;
       navigator.locks.request('codi-content:'+hash+':'+ref.generation,{mode:'shared',signal:lockSignal},async()=>{
         acquired=true;try{
-          const result=await this.#store.read(ref.path,{signal});
+          const result=await this.#admit(()=>this.#store.read(ref.path,{signal}),signal);
           if(result.generation!==ref.generation||result.size!==ref.size||result.sha256!==ref.sha256)throw Error('Saved content did not pass verification.');
           if(this.#closed||signal?.aborted)throw new DOMException('Cancelled','AbortError');
           offered=true;resolve({data:new Blob([result.file]),release});
@@ -52,7 +62,7 @@ export class VerifiedContent {
   async read(ref,{signal=null}={}) {
     const lease=await this.acquire(ref,{signal});
     try{
-      const copy=await this.#store.readCopy(ref.path,{signal});
+      const copy=await this.#admit(()=>this.#store.readCopy(ref.path,{signal}),signal);
       if(copy.generation!==ref.generation||copy.sha256!==ref.sha256||copy.size!==ref.size)throw Error('Saved content did not pass verification.');
       return copy.blob;
     }finally{lease.release();}
