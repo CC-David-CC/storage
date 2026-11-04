@@ -7,11 +7,13 @@ export class VerifiedContent {
   #store;#scope;#lockWaitMs;#closed=false;#abort=new AbortController();
   constructor(scope,options={}) { this.#scope=scope;this.#lockWaitMs=options.lockWaitMs??30000;this.#store=new OPFSStore(scope,options); }
   async capture(blob) {
-    if (!(blob instanceof Blob)) throw Error('A file snapshot is required.');
+    if (!['[object Blob]','[object File]'].includes(Object.prototype.toString.call(blob))) throw Error('A file snapshot is required.');
+    blob=new Blob([blob]);
     const path='/content-'+crypto.randomUUID();
     const saved=await this.#store.save(path,blob,null,{owner:'codi-mirror-content/1'});
     return {kind:'codi-opfs-content/1',path,generation:saved.generation,size:saved.size,sha256:saved.sha256};
   }
+  async verifyLegacy(blob,expected,{signal=null}={}) { return this.#store.verifyBlob(blob,expected,{signal}); }
   async acquire(ref,{signal=null}={}) {
     if(!isContentRef(ref))throw Error('Invalid content reference.');
     if(this.#closed||signal?.aborted)throw new DOMException('Cancelled','AbortError');
