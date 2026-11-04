@@ -5,7 +5,8 @@ globalThis.indexedDB=indexedDB;globalThis.IDBKeyRange=IDBKeyRange;
 const data=new Map();
 const content={
  async capture(blob){const id=crypto.randomUUID(),hash=[...new Uint8Array(await crypto.subtle.digest('SHA-256',await blob.arrayBuffer()))].map(x=>x.toString(16).padStart(2,'0')).join('');const ref={kind:'codi-opfs-content/1',path:'/content-'+id,generation:crypto.randomUUID(),size:blob.size,sha256:hash};data.set(id,blob);return ref},
- async read(ref){return data.get(ref.path.slice('/content-'.length))}
+ async read(ref){return data.get(ref.path.slice('/content-'.length))},
+ async acquire(ref){return {data:await this.read(ref),release(){}}}
 };
 const server={async list(){throw Error('offline')}};
 const legacy=new MirroredFiles({scope:'migration',server,retryMs:0});
