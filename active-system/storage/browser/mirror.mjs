@@ -100,9 +100,22 @@ export class MirroredFiles{
     if(isContentRef(value)){need(this.#content&&typeof this.#content.read==='function','This browser needs the updated file storage.');const blob=await this.#content.read(value,{signal});this.#check();need(blob instanceof Blob&&blob.size===value.size,'Stored content is unavailable.');return blob;}
     need(blobValue(value)||rawBuffer(value),'Invalid stored content.');return new Blob([value]);
   }
+  // Publication and future collection must not overlap between verified
+  // capture and the authoritative mirror transaction.
+  async #withPublicationLock(operation){
+    if(!this.#content)return operation();
+    this.#check();need(navigator.locks,'Browser file locks are unavailable.');
+    const hash=[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(this.#scope)))].map(x=>x.toString(16).padStart(2,'0')).join('');
+    this.#check();const deadline=AbortSignal.timeout(30000),cancel=new AbortController(),timer=setInterval(()=>{try{this.#check()}catch{cancel.abort();this.#captureAbort.abort();this.#content?.close?.()}},100);
+    let acquired=false;
+    try{return await navigator.locks.request('codi-mirror-publish:'+hash,{mode:'shared',signal:AbortSignal.any([deadline,cancel.signal,this.#captureAbort.signal])},async()=>{acquired=true;this.#check();return operation()});}
+    catch(e){if(!acquired&&deadline.aborted&&!this.#captureAbort.signal.aborted)throw Error('Browser file storage is busy. Try again.');throw e;}
+    finally{clearInterval(timer);}
+  }
   // Explicit opt-in migration: preserve the entire legacy row, including
   // attempt/conflict metadata, and publish the reference only via CAS.
-  async migrateContent(path,expected){
+  async migrateContent(path,expected){return this.#withPublicationLock(()=>this.#migrateContent(path,expected));}
+  async #migrateContent(path,expected){
     path=filePath(path);need(this.#content&&typeof this.#content.capture==='function'&&typeof expected==='string','Verified storage is unavailable.');
     const row=await this.#get(path);need(row&&!row.deleted&&!row.directory&&row.version===expected,'File changed; reload before migrating.');
     if(isContentRef(row.data))return false;
@@ -149,6 +162,11 @@ export class MirroredFiles{
     return this.#readBytes(path,maximumBytes,signal);
   }
   async write(path,data,expected=null){
+    // Copy mutable caller bytes before waiting for a cross-tab lock.
+    if(this.#content&&!blobValue(data)&&(byteArray(data)||rawBuffer(data))){need(data.byteLength<=MAX_FILE,'Files are limited to 128 MiB.');data=bytes(data);}
+    return this.#withPublicationLock(()=>this.#write(path,data,expected));
+  }
+  async #write(path,data,expected=null){
     this.#check();const stopValidity=this.#watchValidity();try{
     path=filePath(path);need(path!=='/','Enter a filename.');const incoming=blobValue(data)?data:null;
     // Reject oversize byte inputs before allocating a snapshot of them.
