@@ -116,7 +116,7 @@ export class MirroredFiles{
     const row=await abortable(this.#get(path),signal);need(row&&!row.deleted&&!row.directory,'File not found.');
     if(expected!==null&&row.version!==expected)throw new MirrorConflict();
     let lease;
-    if(isContentRef(row.data)){need(this.#content&&typeof this.#content.acquire==='function','Verified storage is unavailable.');lease=await this.#content.acquire(row.data,{signal});}
+    if(isContentRef(row.data)){need(this.#content&&typeof this.#content.acquire==='function','Verified storage is unavailable.');const pending=this.#content.acquire(row.data,{signal});try{lease=await abortable(pending,signal)}catch(e){Promise.resolve(pending).then(value=>value?.release?.(),()=>{});throw e;}}
     else lease={data:await this.#blob(row.data,{signal}),release(){}};
     try{this.#check();if(signal?.aborted)throw new DOMException('Cancelled','AbortError');const latest=await abortable(this.#get(path),signal);if(!latest||latest.version!==row.version||latest.deleted||latest.sha256!==row.sha256)throw new MirrorConflict();return {...lease,version:row.version,sha256:row.sha256,status:row.conflict?'conflict':row.dirty?'pending':'synced'};}
     catch(e){lease.release();throw e;}
@@ -127,17 +127,26 @@ export class MirroredFiles{
   }
   async status(){const all=await this.#all();return {pending:all.filter(r=>r.dirty&&!r.conflict).length,conflicts:all.filter(r=>r.conflict).length,error:this.#lastError,lastSynced:this.#lastSynced};}
   async stat(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');this.#check();return {bytes:storedSize(r.data),sha256:r.sha256,version:r.version,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
-  async read(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');const data=new Uint8Array(await (await this.#blob(r.data)).arrayBuffer());this.#check();return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
+  async read(path){return this.#readBytes(path,MAX_FILE,null);}
+  async #readBytes(path,maximumBytes,signal){
+    path=filePath(path);if(signal?.aborted)throw new DOMException('Cancelled','AbortError');
+    const r=await abortable(this.#get(path),signal);need(r&&!r.deleted&&!r.directory,'File not found.');
+    need(storedSize(r.data)<=maximumBytes,'This file exceeds the allowed size.');
+    const combined=signal?AbortSignal.any([signal,this.#captureAbort.signal]):this.#captureAbort.signal;
+    const lease=await this.acquireSnapshot(path,{expected:r.version,signal:combined});
+    // Blob.arrayBuffer is not abortable. Keep the generation lease until the
+    // actual browser read settles even when the caller stops waiting.
+    const pending=lease.data.arrayBuffer();pending.finally(lease.release).catch(()=>{});
+    const data=new Uint8Array(await abortable(pending,combined));this.#check();
+    return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};
+  }
   // Immutable snapshot for consumers that can use Blob.slice() or stream().
   async readBlob(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');const data=await this.#blob(r.data);this.#check();return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
   // Size-check the exact IDB record before reading Blob bytes. Legacy records
   // stored as ArrayBuffer may already have been cloned by IndexedDB's get().
   async readBounded(path,maximumBytes,{signal=null}={}){
-    if(signal?.aborted)throw new DOMException('Cancelled','AbortError');
-    path=filePath(path);need(Number.isSafeInteger(maximumBytes)&&maximumBytes>=0&&maximumBytes<=MAX_FILE,'Invalid read size limit.');
-    const r=await abortable(this.#get(path),signal);need(r&&!r.deleted&&!r.directory,'File not found.');
-    need(storedSize(r.data)<=maximumBytes,'This file exceeds the allowed size.');
-    const blob=await abortable(this.#blob(r.data,{signal}),signal);const data=new Uint8Array(await abortable(blob.arrayBuffer(),signal));this.#check();if(signal?.aborted)throw new DOMException('Cancelled','AbortError');return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};
+    need(Number.isSafeInteger(maximumBytes)&&maximumBytes>=0&&maximumBytes<=MAX_FILE,'Invalid read size limit.');
+    return this.#readBytes(path,maximumBytes,signal);
   }
   async write(path,data,expected=null){
     this.#check();const stopValidity=this.#watchValidity();try{
