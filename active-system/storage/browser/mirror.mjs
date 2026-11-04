@@ -31,6 +31,13 @@ function serializeLocal(key,operation,signal){
 // records contain ArrayBuffers; retain read/sync compatibility with them.
 const storedSize=value=>isContentRef(value)?value.size:value instanceof Blob?value.size:value.byteLength;
 async function digest(value){return [...new Uint8Array(await crypto.subtle.digest('SHA-256',value))].map(b=>b.toString(16).padStart(2,'0')).join('');}
+// The browser's Blob.arrayBuffer cannot be cancelled; stop waiting and
+// discard its eventual result when a caller aborts.
+function abortable(task,signal){
+ if(!signal)return task;
+ if(signal.aborted)return Promise.reject(new DOMException('Cancelled','AbortError'));
+ return new Promise((resolve,reject)=>{let done=false;const finish=(err,value)=>{if(done)return;done=true;signal.removeEventListener('abort',abort);err?reject(err):resolve(value)},abort=()=>finish(new DOMException('Cancelled','AbortError'));signal.addEventListener('abort',abort,{once:true});Promise.resolve(task).then(value=>finish(null,value),finish);if(signal.aborted)abort();});
+}
 export class MirrorConflict extends Error{constructor(message='This file changed on another device. Choose which copy to keep.'){super(message);this.name='MirrorConflict';}}
 export class MirrorCommitUncertain extends Error{constructor(){super('Account changed after a local storage transaction committed. Reopen the original account and check the file before retrying.');this.name='MirrorCommitUncertain';}}
 export class MirroredFiles{
@@ -79,7 +86,7 @@ export class MirroredFiles{
   async #mutate(path,fn){return this.#tx('readwrite',(store,done,fail)=>{const request=store.index('scope').getAll(this.#scope);request.onsuccess=()=>{try{this.#check();const all=request.result,old=all.find(r=>r.path===path)||null;const [next,result]=fn(old,all);if(next===null)store.delete([this.#scope,path]);else if(next!==undefined)store.put(next);done(result);}catch(e){fail(e);}};request.onerror=()=>fail(request.error);});}
   async #blob(value){
     if(isContentRef(value)){need(this.#content&&typeof this.#content.read==='function','This browser needs the updated file storage.');const blob=await this.#content.read(value);this.#check();need(blob instanceof Blob&&blob.size===value.size,'Stored content is unavailable.');return blob;}
-    need(blobValue(value)||rawBuffer(value),'Invalid stored content.');return value instanceof Blob?value:new Blob([value]);
+    need(blobValue(value)||rawBuffer(value),'Invalid stored content.');return new Blob([value]);
   }
   // Explicit opt-in migration: preserve the entire legacy row, including
   // attempt/conflict metadata, and publish the reference only via CAS.
@@ -102,11 +109,12 @@ export class MirroredFiles{
   async readBlob(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');const data=await this.#blob(r.data);this.#check();return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
   // Size-check the exact IDB record before reading Blob bytes. Legacy records
   // stored as ArrayBuffer may already have been cloned by IndexedDB's get().
-  async readBounded(path,maximumBytes){
+  async readBounded(path,maximumBytes,{signal=null}={}){
+    if(signal?.aborted)throw new DOMException('Cancelled','AbortError');
     path=filePath(path);need(Number.isSafeInteger(maximumBytes)&&maximumBytes>=0&&maximumBytes<=MAX_FILE,'Invalid read size limit.');
-    const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');
+    const r=await abortable(this.#get(path),signal);need(r&&!r.deleted&&!r.directory,'File not found.');
     need(storedSize(r.data)<=maximumBytes,'This file exceeds the allowed size.');
-    const data=new Uint8Array(await (await this.#blob(r.data)).arrayBuffer());this.#check();return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};
+    const blob=await abortable(this.#blob(r.data),signal);const data=new Uint8Array(await abortable(blob.arrayBuffer(),signal));this.#check();if(signal?.aborted)throw new DOMException('Cancelled','AbortError');return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};
   }
   async write(path,data,expected=null){
     this.#check();const stopValidity=this.#watchValidity();try{

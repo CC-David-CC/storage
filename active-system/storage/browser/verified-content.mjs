@@ -16,7 +16,7 @@ export class VerifiedContent {
     if (!isContentRef(ref)) throw Error('Invalid content reference.');
     const result=await this.#store.read(ref.path);
     if(result.generation!==ref.generation||result.size!==ref.size||result.sha256!==ref.sha256)throw Error('Saved content did not pass verification.');
-    return result.file;
+    return new Blob([result.file]);
   }
   close(){this.#store.close();}
 }
