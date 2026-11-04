@@ -178,7 +178,7 @@ export class MirroredFiles{
     return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};
   }
   // Immutable snapshot for consumers that can use Blob.slice() or stream().
-  async readBlob(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');const lease=await this.acquireSnapshot(path,{expected:r.version});try{const data=isContentRef(r.data)?await this.#blob(r.data):lease.data;this.#check();return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}finally{lease.release();}}
+  async readBlob(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');if(isContentRef(r.data)){const data=await this.#blob(r.data);this.#check();const current=await this.#get(path);if(!current||current.version!==r.version||current.deleted||current.sha256!==r.sha256)throw new MirrorConflict();return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}const lease=await this.acquireSnapshot(path,{expected:r.version});try{this.#check();return {data:lease.data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}finally{lease.release();}}
   // Size-check the exact IDB record before reading Blob bytes. Legacy records
   // stored as ArrayBuffer may already have been cloned by IndexedDB's get().
   async readBounded(path,maximumBytes,{signal=null}={}){

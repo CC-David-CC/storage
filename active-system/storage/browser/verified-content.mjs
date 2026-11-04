@@ -24,7 +24,8 @@ export class VerifiedContent {
       return {kind:'codi-opfs-content/1',path,generation:saved.generation,size:saved.size,sha256:saved.sha256};});
   }
   async verifyLegacy(blob,expected,{signal=null}={}) { return this.#admit(()=>this.#store.verifyBlob(blob,expected,{signal}),signal); }
-  async acquire(ref,{signal=null}={}) {
+  async acquire(ref,{signal=null}={}) {return this.#acquire(ref,signal,false);}
+  async #acquire(ref,signal,independent) {
     if(!isContentRef(ref))throw Error('Invalid content reference.');
     if(this.#closed||signal?.aborted)throw new DOMException('Cancelled','AbortError');
     if(!navigator.locks)throw Error('Browser file locks are unavailable.');
@@ -38,10 +39,10 @@ export class VerifiedContent {
       let offered=false,acquired=false;
       navigator.locks.request('codi-content:'+hash+':'+ref.generation,{mode:'shared',signal:lockSignal},async()=>{
         acquired=true;try{
-          const result=await this.#admit(()=>this.#store.read(ref.path,{signal}),signal);
+          const result=await this.#admit(()=>independent?this.#store.readCopy(ref.path,{signal}):this.#store.read(ref.path,{signal}),signal);
           if(result.generation!==ref.generation||result.size!==ref.size||result.sha256!==ref.sha256)throw Error('Saved content did not pass verification.');
           if(this.#closed||signal?.aborted)throw new DOMException('Cancelled','AbortError');
-          offered=true;resolve({data:new Blob([result.file]),release});
+          offered=true;resolve({data:independent?result.blob:new Blob([result.file]),release});
           // Once handed to the caller, only explicit release (or tab death)
           // releases the lock; closing the account cannot revoke a returned Blob.
           await held;
@@ -60,12 +61,8 @@ export class VerifiedContent {
     });
   }
   async read(ref,{signal=null}={}) {
-    const lease=await this.acquire(ref,{signal});
-    try{
-      const copy=await this.#admit(()=>this.#store.readCopy(ref.path,{signal}),signal);
-      if(copy.generation!==ref.generation||copy.sha256!==ref.sha256||copy.size!==ref.size)throw Error('Saved content did not pass verification.');
-      return copy.blob;
-    }finally{lease.release();}
+    const lease=await this.#acquire(ref,signal,true);
+    try{return lease.data;}finally{lease.release();}
   }
   close(){if(this.#closed)return;this.#closed=true;this.#abort.abort();this.#store.close();}
 }
