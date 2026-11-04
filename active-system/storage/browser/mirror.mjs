@@ -256,6 +256,7 @@ export class MirroredFiles{
   // Import a prevalidated archive as one browser-storage transaction. Server
   // synchronization remains per-entry and can be interrupted or conflict.
   async importTree(root,entries,source,expected){
+    this.#check();const stopValidity=this.#watchValidity();try{
     root=filePath(root);source=filePath(source);
     need(root!=='/'&&source!=='/'&&typeof expected==='string'&&Array.isArray(entries)&&entries.length<MAX_ENTRIES,'Invalid archive import.');
     const rows=[{path:root,directory:true,data:null,sha256:null}],seen=new Set([root]);let total=0;
@@ -285,6 +286,7 @@ export class MirroredFiles{
       done({path:root,entries:rows.length});
     }catch(e){fail(e);}};req.onerror=()=>fail(req.error);});
     this.#hasPending=true;this.#changed();this.#queueSync();return result;
+    }finally{stopValidity()}
   }
   async remove(path,expected){path=filePath(path);need(path!=='/'&&typeof expected==='string','A saved version is required.');await this.#mutate(path,(old,all)=>{need(!all.some(r=>!r.deleted&&parent(r.path)===path),'Folder must be empty before deleting.');if(old?.moving)throw Error('Wait for this move to finish syncing.');if(old?.conflict)throw new MirrorConflict('Resolve the file conflict in Files before deleting.');if(!old||old.deleted||old.version!==expected)throw new MirrorConflict('This item changed; reload before deleting.');return [{...old,version:crypto.randomUUID(),dirty:true,deleted:true,conflict:!!old.conflict},true];});this.#hasPending=true;this.#changed();this.#queueSync();}
   // A new local-only file can change paths in one local transaction. A saved
