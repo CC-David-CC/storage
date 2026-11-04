@@ -165,7 +165,15 @@ export class MirroredFiles{
       need(entry&&typeof entry==='object'&&typeof entry.directory==='boolean','Invalid archive entry.');
       const path=filePath(entry.path);need(path.startsWith(root+'/')&&!seen.has(path),'Duplicate or invalid archive path.');seen.add(path);
       if(entry.directory)rows.push({path,directory:true,data:null,sha256:null});
-      else{const data=bytes(entry.data);need(data&&data.length<=MAX_FILE&&(total+=data.length)<=MAX_FILE,'Archive data exceeds 128 MiB.');const hash=await digest(data);this.#check();rows.push({path,directory:false,data:new Blob([data]),sha256:hash});}
+      else{const data=bytes(entry.data);need(data&&data.length<=MAX_FILE&&(total+=data.length)<=MAX_FILE,'Archive data exceeds 128 MiB.');
+        // Capture and hash through the same worker used for ordinary saves.
+        // Capture completes before the atomic tree transaction.
+        let stored,hash;
+        if(typeof this.#server.captureSnapshot==='function'){
+          const result=await this.#server.captureSnapshot(new Blob([data]),{signal:this.#captureAbort.signal});this.#check();
+          need(result?.blob instanceof Blob&&result.blob.size===data.length&&typeof result.sha256==='string'&&/^[0-9a-f]{64}$/.test(result.sha256),'Invalid file capture.');stored=result.blob;hash=result.sha256;
+        }else{hash=await digest(data);stored=new Blob([data]);this.#check();}
+        rows.push({path,directory:false,data:stored,sha256:hash});}
     }
     const directories=new Set(rows.filter(r=>r.directory).map(r=>r.path));
     for(const row of rows.slice(1))need(directories.has(parent(row.path)),'Archive is missing a parent folder.');
