@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import {indexedDB,IDBKeyRange} from 'fake-indexeddb';
 import {MirroredFiles} from '../active-system/storage/browser/mirror.mjs';
 globalThis.indexedDB=indexedDB;globalThis.IDBKeyRange=IDBKeyRange;
+Object.defineProperty(globalThis,'navigator',{value:{locks:{request:async(_name,_options,fn)=>fn()}},configurable:true});
 const data=new Map();
 const content={
  async capture(blob){const id=crypto.randomUUID(),hash=[...new Uint8Array(await crypto.subtle.digest('SHA-256',await blob.arrayBuffer()))].map(x=>x.toString(16).padStart(2,'0')).join('');const ref={kind:'codi-opfs-content/1',path:'/content-'+id,generation:crypto.randomUUID(),size:blob.size,sha256:hash};data.set(id,blob);return ref},
@@ -38,6 +39,15 @@ const slowRead={...content,async read(ref){enteredRead();await readGate;return c
 const waiting=new MirroredFiles({scope:'migration',server,content:slowRead,retryMs:0});
 const read=waiting.readBounded('/old.txt',100,{signal:ctrl.signal});await readEntered;ctrl.abort();
 await assert.rejects(()=>read,e=>e.name==='AbortError');releaseRead();waiting.close();
+// An aborted native Blob read can continue; its lease must not be released
+// until the underlying browser operation actually settles.
+let releaseBytes,bytesStarted,released=0;
+const byteGate=new Promise(r=>releaseBytes=r),byteEntered=new Promise(r=>bytesStarted=r);
+const held={...content,async acquire(ref){const blob=await content.read(ref);blob.arrayBuffer=()=>{bytesStarted();return byteGate};return {data:blob,release(){released++}}}};
+const heldMirror=new MirroredFiles({scope:'migration',server,content:held,retryMs:0}),abortBytes=new AbortController();
+const pendingBytes=heldMirror.readBounded('/old.txt',100,{signal:abortBytes.signal});await byteEntered;abortBytes.abort();
+await assert.rejects(()=>pendingBytes,e=>e.name==='AbortError');assert.equal(released,0);
+releaseBytes(new Uint8Array([1]).buffer);await new Promise(r=>setTimeout(r,0));assert.equal(released,1);heldMirror.close();
 m.close();
 const reopened=new MirroredFiles({scope:'migration',server,content,retryMs:0});
 assert.equal(await (await reopened.readBlob('/old.txt')).data.text(),'new content');
