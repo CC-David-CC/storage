@@ -33,7 +33,8 @@ new=r" handle /gateway/upload {\n reverse_proxy 127.0.0.1:19868\n }\n handle /ga
 assert text.count(old)==1;text=text.replace(old,new)
 needle='  # The combined file client loads its verifier beside the served client.\n';assert text.count(needle)==1
 text=text.replace(needle,"  shutil.copy2(os.environ['CODI_SDK'],public/'gateway_service/client.mjs')\n"+needle)
-text=text.replace(needle,"  shutil.copy2(ROOT/'storage/browser/verified-content.mjs',public/'storage/browser/verified-content.mjs')\n  shutil.copytree(ROOT/'storage/browser/opfs',public/'storage/browser/opfs')\n"+needle)
+# The shared fixture stages the closed storage allowlist, including workers.
+# Do not recursively copy it again or mix a different source graph into output.
 # Tests can use the exact deployed desktop CSP on an isolated localhost site.
 if os.environ.get('CODI_CSP'):
  policy=os.environ['CODI_CSP'].replace(chr(39),chr(92)+chr(39))
@@ -49,4 +50,10 @@ if os.environ.get('CODI_CSP'):
 if os.environ.get('CODI_CADDY'):
  text=text.replace("'/tmp/codi-microduck-hosting-evidence/caddy'","os.environ['CODI_CADDY']")
 text=text.replace("cfg.write_text('http://","cfg.write_text('{\\n admin off\\n}\\nhttp://")
+# Dedicated ports let an independent reviewer avoid existing SSH forwards and
+# other fixtures. Apply only after the exact template substitutions above.
+for variable,default in [('CODI_TEST_PORT',19864),('CODI_CUT_PORT',19868)]:
+ port=int(os.environ.get(variable,str(default)))
+ if not 1024<=port<=65535:raise ValueError('Invalid isolated fixture port')
+ if port!=default:text=text.replace(str(default),str(port))
 exec(compile(text,str(original),'exec'),{'__name__':'__main__','__file__':str(original)})
