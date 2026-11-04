@@ -137,7 +137,7 @@ export class MirroredFiles{
       this.#check();const rows=await this.#all();need(rows.length<=MAX_ENTRIES,'Browser file limit exceeded; collection stopped.');
       const page=await this.#content.collectionPage(phase,after,limit);this.#check();const counts={removed:0,referenced:0,leased:0,retained:0};
       for(const item of page.items){
-        this.#check();if(!item.current||item.current.owner!=='codi-mirror-content/1'||item.current.generation!==item.generation||!/^\/content-[a-f0-9-]{36}$/.test(item.path??'')||!/^[0-9a-f]{64}$/.test(item.current.sha256??'')||item.previous||item.sync?.attempt||item.sync?.base){counts.retained++;continue;}
+        this.#check();if(!item.current||item.current.owner!=='codi-mirror-content/1'||item.current.generation!==item.generation||!/^\/content-[a-f0-9-]{36}$/.test(item.path??'')||!/^[0-9a-f]{64}$/.test(item.current.sha256??'')||!Number.isSafeInteger(item.current.size)||item.current.size<0||item.current.size>MAX_FILE||item.previous||item.sync?.attempt||item.sync?.base){counts.retained++;continue;}
         const verdict=await this.#content.tryRetire(item,async candidate=>{
           this.#check();const current=await this.#all();need(current.length<=MAX_ENTRIES,'Browser file limit exceeded; collection stopped.');for(const row of current){if(row.data?.kind==='codi-opfs-content/1')need(isContentRef(row.data)&&row.data.sha256===row.sha256,'Stored content metadata is inconsistent; collection stopped.');}
           return !current.some(row=>(isContentRef(row.data)&&row.data.generation===candidate.generation)||[row.sha256,row.base,row.attempted?.sha256].includes(candidate.current.sha256));
