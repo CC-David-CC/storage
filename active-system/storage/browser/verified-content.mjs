@@ -12,9 +12,9 @@ export class VerifiedContent {
     const saved=await this.#store.save(path,blob);
     return {kind:'codi-opfs-content/1',path,generation:saved.generation,size:saved.size,sha256:saved.sha256};
   }
-  async read(ref) {
+  async read(ref,{signal=null}={}) {
     if (!isContentRef(ref)) throw Error('Invalid content reference.');
-    const result=await this.#store.read(ref.path);
+    const result=await this.#store.read(ref.path,{signal});
     if(result.generation!==ref.generation||result.size!==ref.size||result.sha256!==ref.sha256)throw Error('Saved content did not pass verification.');
     return new Blob([result.file]);
   }

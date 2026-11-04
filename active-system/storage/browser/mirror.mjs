@@ -62,13 +62,25 @@ export class MirroredFiles{
   #queueSync(){if(this.#closed)return;if(this.#running){this.sync().catch(()=>{});return;}if(this.#rateFailures&&this.#retryMs){if(!this.#timer)this.#schedule();return;}this.sync().catch(()=>{});}
   #check(){need(!this.#closed&&this.#valid(),'Account changed. Reopen your files.');}
   #changed(){for(const fn of this.#listeners)try{fn();}catch(e){console.error('File view update failed',e);}}
-  #watchValidity(){const timer=setInterval(()=>{try{this.#check()}catch{this.#captureAbort.abort();clearInterval(timer)}},100);return ()=>clearInterval(timer);}
+  #watchValidity(){const timer=setInterval(()=>{try{this.#check()}catch{this.#captureAbort.abort();this.#content?.close?.();clearInterval(timer)}},100);return ()=>clearInterval(timer);}
   subscribe(fn){this.#check();need(typeof fn==='function','Listener required.');this.#listeners.add(fn);return ()=>this.#listeners.delete(fn);}
   async #open(){
     this.#check();if(this.#db)return this.#db;
-    this.#opening??=new Promise((resolve,reject)=>{const request=indexedDB.open('codi-mirrored-files-v1',1);
-      request.onupgradeneeded=()=>{const store=request.result.createObjectStore('files',{keyPath:['scope','path']});store.createIndex('scope','scope');};
-      request.onerror=()=>reject(request.error);request.onblocked=()=>reject(Error('Browser file storage is blocked.'));request.onsuccess=()=>resolve(request.result);
+    this.#opening??=new Promise((resolve,reject)=>{
+      let settled=false,request;
+      const finish=(error,db)=>{if(settled){db?.close();return;}settled=true;clearTimeout(deadline);clearInterval(validity);this.#captureAbort.signal.removeEventListener('abort',abort);error?reject(error):resolve(db);};
+      const abort=()=>finish(new DOMException('Account changed or closed','AbortError'));
+      const deadline=setTimeout(()=>finish(Error('Browser file storage timed out.')),10000);
+      const validity=setInterval(()=>{try{this.#check()}catch(e){finish(e)}},100);
+      this.#captureAbort.signal.addEventListener('abort',abort,{once:true});
+      try{
+        request=indexedDB.open('codi-mirrored-files-v1',this.#content?2:1);
+        request.onupgradeneeded=()=>{if(settled){try{request.transaction.abort()}catch{}return;}const db=request.result;if(!db.objectStoreNames.contains('files')){const store=db.createObjectStore('files',{keyPath:['scope','path']});store.createIndex('scope','scope');}};
+        request.onerror=()=>finish(request.error||Error('Browser file storage failed.'));
+        request.onblocked=()=>finish(Error('Browser file storage is blocked. Close older file sessions and retry.'));
+        request.onsuccess=()=>finish(null,request.result);
+        if(this.#captureAbort.signal.aborted)abort();
+      }catch(e){finish(e);}
     }).then(db=>{if(this.#closed||!this.#valid()){db.close();throw Error('Account changed. Reopen your files.');}db.onversionchange=()=>{db.close();this.#db=null;};return this.#db=db;}).finally(()=>{this.#opening=null;});
     return this.#opening;
   }
@@ -84,8 +96,8 @@ export class MirroredFiles{
   async #update(path,fn){return this.#tx('readwrite',(store,done,fail)=>{const request=store.get([this.#scope,path]);request.onsuccess=()=>{try{this.#check();const [next,result]=fn(request.result||null);if(next===null)store.delete([this.#scope,path]);else if(next!==undefined)store.put(next);done(result);}catch(e){fail(e);}};request.onerror=()=>fail(request.error);});}
   // Validate hierarchy and write within one IndexedDB transaction across tabs.
   async #mutate(path,fn){return this.#tx('readwrite',(store,done,fail)=>{const request=store.index('scope').getAll(this.#scope);request.onsuccess=()=>{try{this.#check();const all=request.result,old=all.find(r=>r.path===path)||null;const [next,result]=fn(old,all);if(next===null)store.delete([this.#scope,path]);else if(next!==undefined)store.put(next);done(result);}catch(e){fail(e);}};request.onerror=()=>fail(request.error);});}
-  async #blob(value){
-    if(isContentRef(value)){need(this.#content&&typeof this.#content.read==='function','This browser needs the updated file storage.');const blob=await this.#content.read(value);this.#check();need(blob instanceof Blob&&blob.size===value.size,'Stored content is unavailable.');return blob;}
+  async #blob(value,{signal=null}={}){
+    if(isContentRef(value)){need(this.#content&&typeof this.#content.read==='function','This browser needs the updated file storage.');const blob=await this.#content.read(value,{signal});this.#check();need(blob instanceof Blob&&blob.size===value.size,'Stored content is unavailable.');return blob;}
     need(blobValue(value)||rawBuffer(value),'Invalid stored content.');return new Blob([value]);
   }
   // Explicit opt-in migration: preserve the entire legacy row, including
@@ -114,7 +126,7 @@ export class MirroredFiles{
     path=filePath(path);need(Number.isSafeInteger(maximumBytes)&&maximumBytes>=0&&maximumBytes<=MAX_FILE,'Invalid read size limit.');
     const r=await abortable(this.#get(path),signal);need(r&&!r.deleted&&!r.directory,'File not found.');
     need(storedSize(r.data)<=maximumBytes,'This file exceeds the allowed size.');
-    const blob=await abortable(this.#blob(r.data),signal);const data=new Uint8Array(await abortable(blob.arrayBuffer(),signal));this.#check();if(signal?.aborted)throw new DOMException('Cancelled','AbortError');return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};
+    const blob=await abortable(this.#blob(r.data,{signal}),signal);const data=new Uint8Array(await abortable(blob.arrayBuffer(),signal));this.#check();if(signal?.aborted)throw new DOMException('Cancelled','AbortError');return {data,sha256:r.sha256,version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced'};
   }
   async write(path,data,expected=null){
     this.#check();const stopValidity=this.#watchValidity();try{
@@ -332,5 +344,5 @@ export class MirroredFiles{
   }
   async persistence(){return {supported:typeof navigator.storage?.persist==='function'&&typeof navigator.storage?.persisted==='function',persistent:typeof navigator.storage?.persisted==='function'&&await navigator.storage.persisted()===true};}
   async requestPersistence(){need(navigator.userActivation?.isActive,'Use the storage protection button.');need(typeof navigator.storage?.persist==='function','Storage protection is unavailable.');await navigator.storage.persist();return this.persistence();}
-  close(){if(this.#closed)return;this.#closed=true;this.#captureAbort.abort();clearTimeout(this.#timer);globalThis.removeEventListener?.('online',this.#online);globalThis.document?.removeEventListener?.('visibilitychange',this.#visibility);this.#listeners.clear();this.#checked.clear();this.#db?.close();this.#db=null;}
+  close(){if(this.#closed)return;this.#closed=true;this.#captureAbort.abort();this.#content?.close?.();clearTimeout(this.#timer);globalThis.removeEventListener?.('online',this.#online);globalThis.document?.removeEventListener?.('visibilitychange',this.#visibility);this.#listeners.clear();this.#checked.clear();this.#db?.close();this.#db=null;}
 }
