@@ -9,7 +9,7 @@ const content={
 };
 const server={async list(){throw Error('offline')}};
 const legacy=new MirroredFiles({scope:'migration',server,retryMs:0});
-const old=await legacy.write('/old.txt','old content');legacy.close();
+const old=await legacy.write('/old.txt','old content');const raced=await legacy.write('/race.txt','first');legacy.close();
 const m=new MirroredFiles({scope:'migration',server,content,retryMs:0});
 assert.equal(await m.migrateContent('/old.txt',old.version),true);
 let row=await m.read('/old.txt');assert.equal(row.version,old.version);assert.equal(row.status,'pending');assert.equal(new TextDecoder().decode(row.data),'old content');
@@ -21,7 +21,7 @@ assert.equal(new TextDecoder().decode((await m.read('/copy.txt')).data),'new con
 await m.remove('/copy.txt',copied.version);
 await assert.rejects(()=>m.migrateContent('/old.txt',old.version),/changed/);
 // A local edit while OPFS capture is in flight wins over the migration.
-const raceLegacy=new MirroredFiles({scope:'migration',server,retryMs:0});const raced=await raceLegacy.write('/race.txt','first');raceLegacy.close();let release,started;
+let release,started;
 const entered=new Promise(r=>started=r),gate=new Promise(r=>release=r);
 const slow={...content,async capture(blob){started();await gate;return content.capture(blob)}};
 const otherTab=new MirroredFiles({scope:'migration',server,content:slow,retryMs:0});
