@@ -9,7 +9,7 @@ export class VerifiedContent {
   async capture(blob) {
     if (!(blob instanceof Blob)) throw Error('A file snapshot is required.');
     const path='/content-'+crypto.randomUUID();
-    const saved=await this.#store.save(path,blob);
+    const saved=await this.#store.save(path,blob,null,{owner:'codi-mirror-content/1'});
     return {kind:'codi-opfs-content/1',path,generation:saved.generation,size:saved.size,sha256:saved.sha256};
   }
   async acquire(ref,{signal=null}={}) {
@@ -35,6 +35,16 @@ export class VerifiedContent {
           await held;
         }catch(e){if(!offered)reject(e);else throw e}
       }).catch(e=>{if(!offered)reject(!acquired&&deadline.aborted&&!signal?.aborted&&!this.#abort.signal.aborted?new StorageUnavailable('lock-timeout'):e)});
+    });
+  }
+  async collectionPage(status,after,limit){return this.#store.collectionPage(status,after,limit);}
+  async tryRetire(item,recheck){
+    if(this.#closed)throw new DOMException('Cancelled','AbortError');
+    const hash=[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(this.#scope)))].map(x=>x.toString(16).padStart(2,'0')).join('');
+    return navigator.locks.request('codi-content:'+hash+':'+item.generation,{mode:'exclusive',ifAvailable:true},async lock=>{
+      if(!lock)return 'leased';
+      if(!await recheck(item))return 'referenced';
+      await this.#store.retireCandidate(item);return 'removed';
     });
   }
   async read(ref,{signal=null}={}) {

@@ -19,6 +19,7 @@ const byteArray=value=>ArrayBuffer.isView(value)&&Object.prototype.toString.call
 const rawBuffer=value=>Object.prototype.toString.call(value)==='[object ArrayBuffer]';
 const blobValue=value=>['[object Blob]','[object File]'].includes(Object.prototype.toString.call(value));
 const bytes=value=>typeof value==='string'?new TextEncoder().encode(value):byteArray(value)?new Uint8Array(value):rawBuffer(value)?new Uint8Array(ArrayBuffer.prototype.slice.call(value,0)):null;
+const PUBLICATION_LOCKED=Symbol('publication-locked');
 const localQueues=new Map();
 function serializeLocal(key,operation,signal){
  let started=false;const previous=localQueues.get(key)??Promise.resolve(),current=previous.catch(()=>{}).then(()=>{if(signal.aborted)throw new DOMException('Cancelled','AbortError');started=true;return operation()});
@@ -122,6 +123,29 @@ export class MirroredFiles{
     const ref=await this.#content.capture(await this.#blob(row.data));this.#check();
     need(isContentRef(ref)&&ref.size===storedSize(row.data)&&ref.sha256===row.sha256,'Saved content did not pass verification.');
     return this.#update(path,current=>{if(!current||current.version!==expected||current.sha256!==row.sha256||current.deleted||current.directory||isContentRef(current.data))throw new MirrorConflict();return [{...current,data:ref},true];});
+  }
+  // Explicit bounded collection only; never invoked automatically. Every
+  // participant must use the versioned publication and snapshot lock protocol.
+  async collectGarbage({cursor=null,limit=16}={}){
+    this.#check();need(this.#content&&typeof this.#content.collectionPage==='function'&&typeof this.#content.tryRetire==='function','Verified storage is unavailable.');
+    need(navigator.locks&&Number.isInteger(limit)&&limit>=1&&limit<=32,'Invalid collection request.');
+    const phase=cursor?.phase??'collecting',after=cursor?.after??null;
+    need(['collecting','published'].includes(phase)&&(after===null||/^[a-f0-9-]{36}$/.test(after)),'Invalid collection cursor.');
+    const hash=[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(this.#scope)))].map(x=>x.toString(16).padStart(2,'0')).join('');
+    this.#check();const deadline=AbortSignal.timeout(30000);
+    return navigator.locks.request('codi-mirror-publish:'+hash,{mode:'exclusive',signal:AbortSignal.any([deadline,this.#captureAbort.signal])},async()=>{
+      this.#check();const rows=await this.#all();need(rows.length<=MAX_ENTRIES,'Browser file limit exceeded; collection stopped.');
+      const page=await this.#content.collectionPage(phase,after,limit);this.#check();const counts={removed:0,referenced:0,leased:0,retained:0};
+      for(const item of page.items){
+        this.#check();if(!item.current||item.current.owner!=='codi-mirror-content/1'||item.current.generation!==item.generation||!/^\/content-[a-f0-9-]{36}$/.test(item.path??'')||!/^[0-9a-f]{64}$/.test(item.current.sha256??'')||item.previous||item.sync?.attempt||item.sync?.base){counts.retained++;continue;}
+        const verdict=await this.#content.tryRetire(item,async candidate=>{
+          this.#check();const current=await this.#all();need(current.length<=MAX_ENTRIES,'Browser file limit exceeded; collection stopped.');for(const row of current){if(row.data?.kind==='codi-opfs-content/1')need(isContentRef(row.data)&&row.data.sha256===row.sha256,'Stored content metadata is inconsistent; collection stopped.');}
+          return !current.some(row=>(isContentRef(row.data)&&row.data.generation===candidate.generation)||[row.sha256,row.base,row.attempted?.sha256].includes(candidate.current.sha256));
+        });counts[verdict]++;
+      }
+      const next=page.more?{phase,after:page.next}:phase==='collecting'?{phase:'published',after:null}:null;
+      return {...counts,next};
+    });
   }
   // Caller owns the returned lease and must release it after consuming data.
   async acquireSnapshot(path,{signal=null,expected=null}={}){
@@ -385,7 +409,7 @@ export class MirroredFiles{
     return serializeLocal(this.#scope,()=>{const locks=globalThis.navigator?.locks;return locks?.request?locks.request('codi-mirror:'+this.#scope,{mode:'exclusive',signal},operation):operation();},signal).finally(()=>clearInterval(timer));
   }
   sync(){this.#check();if(this.#running){this.#again=true;return this.#running;}const run=async()=>{let result;do{this.#again=false;result=await this.#pass();}while(this.#again&&!this.#closed&&this.#valid());return result;};const task=this.#exclusive(run).then(result=>{this.#rateFailures=0;this.#lastError=null;this.#lastSynced=Date.now();this.#changed();return result;},error=>{if(!this.#closed){if(error?.status===429)this.#rateFailures=Math.min(this.#rateFailures+1,8);else this.#rateFailures=0;this.#lastError=error.message||'Server sync unavailable.';this.#changed();}throw error;}).finally(()=>{const repeat=this.#again;this.#again=false;if(this.#running===task)this.#running=null;this.#schedule();if(repeat&&!this.#rateFailures&&!this.#closed&&this.#valid())this.sync().catch(()=>{});});this.#running=task;return task;}
-  async resolve(path,choice,expected){this.#check();const stopValidity=this.#watchValidity();try{path=filePath(path);need(['local','server'].includes(choice),'Choose which copy to keep.');const row=await this.#get(path);if(!row||!row.conflict||row.version!==expected)throw new MirrorConflict('This item changed; reload before resolving.');need(!row.directory,'Folder conflicts require manual resolution.');
+  async resolve(path,choice,expected,internal=null){if(this.#content&&internal!==PUBLICATION_LOCKED)return this.#withPublicationLock(()=>this.resolve(path,choice,expected,PUBLICATION_LOCKED));this.#check();const stopValidity=this.#watchValidity();try{path=filePath(path);need(['local','server'].includes(choice),'Choose which copy to keep.');const row=await this.#get(path);if(!row||!row.conflict||row.version!==expected)throw new MirrorConflict('This item changed; reload before resolving.');need(!row.directory,'Folder conflicts require manual resolution.');
     const inventory=await this.#remoteInventory(),entry=inventory.get(path);need(!entry?.directory,'The server has a folder at this path.');const remote=entry?await this.#server.read(path.slice(1),{signal:this.#captureAbort.signal}):null;this.#check();
     if(choice==='local'){await this.#update(path,current=>{if(!current||current.version!==expected)throw new MirrorConflict();return [{...current,base:remote?.sha256??null,attempted:null,conflict:false,dirty:true},true];});}
     else{await this.#update(path,current=>{if(!current||current.version!==expected)throw new MirrorConflict();if(!remote)return [null,true];return [{scope:this.#scope,path,directory:false,data:new Blob([remote.data]),sha256:remote.sha256,base:remote.sha256,version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false},true];});}
