@@ -1,0 +1,7 @@
+# Storage integration checkpoint
+
+Base: desktop 3c17a98883bac8bd81e80bfaf074786869b5b978. The existing desktop mirror at that base predates the live beta guard. The mirror now exactly matches the beta guarded floor, SHA-256 cbfafe53eae1afdac1f2a9af0bfdbd26cae59b1be8f5d96f6bebec2a56c158ed, carrying attempted-write reconciliation, conflict guards, account cancellation and the Blob read API. The current beta requires the matching 44da SDK; source integration alone is not deployment or qualification of a new bundle.
+
+The OPFS directory was copied from 796a10f6622c7fa9121f772ff4662101e9831761 without wiring it into desktop. Existing desktop IndexedDB mirror records remain authoritative; do not migrate, delete, or reinterpret them until a compatibility adapter can atomically preserve their path, version, conflict, move and attempt metadata. The OPFS research store has a separate database and does not implement the Files host contract. The integration must not switch between these independent authoritative databases, or an older tab can miss pending edits.
+
+On R730, Node v24.22.1 with fake-indexeddb 6.2.4 passed `node --test tests/mirrored-files.test.mjs tests/files-sync-status.test.mjs tests/file-capture-worker.test.mjs`. These are local tests, not public beta or power-loss evidence. Provide the npm dependency separately for reproducibility; it is not application source or a committed runtime dependency.
