@@ -347,16 +347,22 @@ export class MirroredFiles{
   });}
   async #ack(row,base,{remove=false}={}){await this.#update(row.path,current=>{if(!current||current.conflict||current.moving)return [undefined,false];if(current.version===row.version)return [remove?null:{...current,base,attempted:null,dirty:false,conflict:false},true];if(current.base===row.base)return [{...current,base,attempted:null},false];return [undefined,false];});}
   async #conflict(row){await this.#update(row.path,current=>current?.version===row.version?[{...current,conflict:true},true]:[undefined,false]);}
-  async #restoreCompatibleDirectory(row,remote,scan){
+  async #restoreCompatibleDirectory(row,remote,scan,cohort){
     const admissible=value=>value?.directory===true&&value.conflict===true&&value.deleted===false&&typeof value.version==='string'&&value.version.length>0&&
       value.data===null&&value.sha256===null&&typeof value.dirty==='boolean'&&
       (value.base==='dir'||(value.base===null&&value.dirty))&&
       (value.moving===undefined||value.moving===false)&&value.attempted==null&&value.moveTo==null&&value.moveFrom==null;
     this.#check();if(this.#scans.active!==scan||remote?.directory!==true||!admissible(row))return false;
-    return this.#update(row.path,current=>{
+    const purpose=['path','version','directory','conflict','deleted','sha256','dirty','base','moving','moveTo','moveFrom'];
+    const payload=data=>data==null?'none':isContentRef(data)?JSON.stringify([data.kind,data.path,data.generation,data.sha256,data.size]):blobValue(data)?JSON.stringify(['blob',data.size,data.type]):rawBuffer(data)?JSON.stringify(['buffer',data.byteLength]):'unknown';
+    const same=(a,b)=>purpose.every(key=>a[key]===b[key])&&
+      a.attempted?.base===b.attempted?.base&&a.attempted?.sha256===b.attempted?.sha256&&payload(a.data)===payload(b.data);
+    return this.#mutate(row.path,(current,all)=>{
       this.#check();
       if(this.#scans.active!==scan||!admissible(current)||
         !['version','directory','conflict','deleted','data','sha256','dirty','base','moving','attempted','moveTo','moveFrom'].every(key=>current[key]===row[key]))return [undefined,false];
+      const now=all.filter(item=>item.path.startsWith(row.path+'/')).sort((a,b)=>a.path.localeCompare(b.path));
+      if(now.length!==cohort.length||now.some((item,index)=>!same(item,cohort[index])))return [undefined,false];
       // Only the obsolete parent type conflict changes. Descendants, payload,
       // remote base and pending intent remain authoritative and untouched.
       return [{...current,conflict:false,version:crypto.randomUUID()},true];
@@ -400,7 +406,39 @@ export class MirroredFiles{
     if(rows.some(r=>r.moving)){remote=await this.#remoteInventory();rows=await this.#all();inventoryCheckedAt=Date.now();}
     const compatible=rows.filter(row=>row.directory&&row.conflict&&remote.get(row.path)?.directory===true);
     if(compatible.length){
-      for(const row of compatible)await this.#restoreCompatibleDirectory(row,remote.get(row.path),scan);
+      // A type match alone cannot acknowledge deletion of a side retained by
+      // the parent conflict. Proof is metadata-only and explicitly bounded.
+      let proofPaths=0;const proofCache=new Map();
+      const counterpart=async files=>{
+        for(let index=0;index<files.length;index++){
+          const file=files[index],relative=file.path.slice(1),entry=remote.get(file.path);
+          if(entry.sha256){if(entry.sha256!==file.sha256)return false;continue;}
+          if(!canVersion)return false;
+          if(!proofCache.has(relative)){
+            const paths=[];let bytes=0;
+            for(let i=index;i<files.length&&paths.length<(canBatch?16:1);i++){
+              const candidate=files[i].path.slice(1),item=remote.get(files[i].path),size=new TextEncoder().encode(candidate).length;
+              if(item.sha256||proofCache.has(candidate))continue;
+              if(proofPaths+paths.length>=64||bytes+size>8192)break;
+              paths.push(candidate);bytes+=size;
+            }
+            if(!paths.length)return false;
+            proofPaths+=paths.length;
+            const values=canBatch?await this.#server.versions(paths,{signal:this.#captureAbort.signal}):[await this.#server.version(paths[0],{signal:this.#captureAbort.signal})];
+            this.#check();need(Array.isArray(values)&&values.length===paths.length,'Invalid batch file versions.');
+            for(let i=0;i<paths.length;i++){proofCache.set(paths[i],values[i]);batchCache.set(paths[i],values[i]);}
+          }
+          const value=proofCache.get(relative);
+          if(!/^[0-9a-f]{64}$/.test(value?.sha256??'')||value.sha256!==file.sha256)return false;
+        }return true;
+      };
+      for(const row of compatible){
+        const cohort=rows.filter(item=>item.path.startsWith(row.path+'/')).sort((a,b)=>a.path.localeCompare(b.path));
+        if(cohort.some(item=>typeof item.directory!=='boolean'||typeof item.dirty!=='boolean'||typeof item.deleted!=='boolean'||typeof item.conflict!=='boolean'||typeof item.version!=='string'||!item.version))continue;
+        const clean=cohort.filter(item=>!item.dirty&&!item.deleted),files=[];let proven=true;
+        for(const item of clean){const other=remote.get(item.path);if(!other||typeof item.directory!=='boolean'||other.directory!==item.directory){proven=false;break;}if(!item.directory){if(!/^[0-9a-f]{64}$/.test(item.sha256??'')){proven=false;break;}files.push(item);}}
+        if(proven&&await counterpart(files))await this.#restoreCompatibleDirectory(row,remote.get(row.path),scan,cohort);
+      }
       // Both successful restoration and a lost CAS require current rows before
       // classifying pending intent; never reuse the conflicted snapshot here.
       rows=await this.#all();this.#check();
@@ -440,6 +478,7 @@ export class MirroredFiles{
     // Re-read current local rows: an edit can arrive while the server is slow.
     const fresh=await this.#all(),local=new Map(fresh.map(r=>[r.path,r])),issues=[];
     const entries=[...remote];
+    const unresolvedRoots=fresh.filter(row=>row.directory&&row.conflict).map(row=>row.path);
     const reusable=(path,row,item)=>{
       const check=scan.checked.get(path);
       if(!row||!check||check.version!==row.version||check.sha256!==row.sha256)return false;
@@ -449,7 +488,7 @@ export class MirroredFiles{
       if(item.sha256){check.checkedAt=inventoryCheckedAt;check.attempt=scan.attempts;}
       return true;
     };
-    for(let index=0;index<entries.length;index++){const [path,item]=entries[index];this.#check();const row=local.get(path);if(row?.dirty)continue;
+    for(let index=0;index<entries.length;index++){const [path,item]=entries[index];this.#check();const row=local.get(path);if(row?.dirty||row?.conflict||unresolvedRoots.some(root=>path===root||path.startsWith(root+'/')))continue;
       if(item.directory){if(!row)await this.#install({path,version:null},{directory:true});else if(!row.directory)await this.#conflict({...row,dirty:true});continue;}
       if(row?.directory){await this.#conflict({...row,dirty:true});continue;}
       // Explicit continuations may retain verified earlier visits. Public
@@ -459,7 +498,7 @@ export class MirroredFiles{
     }
     const cleanupRows=await this.#all();this.#check();
     const unresolvedDirectories=cleanupRows.filter(row=>row.directory&&row.conflict).map(row=>row.path);
-    for(const row of cleanupRows){if(row.dirty||remote.has(row.path)||unresolvedDirectories.some(path=>row.path===path||row.path.startsWith(path+'/')))continue;if(row.directory&&cleanupRows.some(child=>child.dirty&&child.path.startsWith(row.path+'/')))continue;await this.#update(row.path,current=>current&&!current.dirty&&current.version===row.version?[null,true]:[undefined,false]);}
+    for(const row of cleanupRows){if(row.dirty||row.conflict||remote.has(row.path)||unresolvedDirectories.some(path=>row.path===path||row.path.startsWith(path+'/')))continue;if(row.directory&&cleanupRows.some(child=>child.dirty&&child.path.startsWith(row.path+'/')))continue;await this.#update(row.path,current=>current&&!current.dirty&&!current.conflict&&current.version===row.version?[null,true]:[undefined,false]);}
     this.#changed();if(issues.length){
       // This pass reached the end: it is a completed partial scan, not a
       // rate-limited/interrupted frontier. Retry all paths next time so one
