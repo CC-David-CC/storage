@@ -347,6 +347,21 @@ export class MirroredFiles{
   });}
   async #ack(row,base,{remove=false}={}){await this.#update(row.path,current=>{if(!current||current.conflict||current.moving)return [undefined,false];if(current.version===row.version)return [remove?null:{...current,base,attempted:null,dirty:false,conflict:false},true];if(current.base===row.base)return [{...current,base,attempted:null},false];return [undefined,false];});}
   async #conflict(row){await this.#update(row.path,current=>current?.version===row.version?[{...current,conflict:true},true]:[undefined,false]);}
+  async #restoreCompatibleDirectory(row,remote,scan){
+    const admissible=value=>value?.directory===true&&value.conflict===true&&value.deleted===false&&typeof value.version==='string'&&value.version.length>0&&
+      value.data===null&&value.sha256===null&&typeof value.dirty==='boolean'&&
+      (value.base==='dir'||(value.base===null&&value.dirty))&&
+      (value.moving===undefined||value.moving===false)&&value.attempted==null&&value.moveTo==null&&value.moveFrom==null;
+    this.#check();if(this.#scans.active!==scan||remote?.directory!==true||!admissible(row))return false;
+    return this.#update(row.path,current=>{
+      this.#check();
+      if(this.#scans.active!==scan||!admissible(current)||
+        !['version','directory','conflict','deleted','data','sha256','dirty','base','moving','attempted','moveTo','moveFrom'].every(key=>current[key]===row[key]))return [undefined,false];
+      // Only the obsolete parent type conflict changes. Descendants, payload,
+      // remote base and pending intent remain authoritative and untouched.
+      return [{...current,conflict:false,version:crypto.randomUUID()},true];
+    });
+  }
   async #install(row,remote){await this.#update(row.path,current=>{if(row.version===null?!!current:!current||current.version!==row.version||current.dirty)return [undefined,false];return [{scope:this.#scope,path:row.path,directory:remote.directory,data:remote.data??null,sha256:remote.sha256??null,base:remote.directory?'dir':remote.sha256,version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false},true];});}
   async #installRemote(row,value){
     if(!this.#content)return this.#install(row,{directory:false,data:new Blob([value.data]),sha256:value.sha256});
@@ -383,6 +398,13 @@ export class MirroredFiles{
       throw Error(changed?'The file changed on the server; resolve the conflict before moving.':'The destination already exists on the server.');
     }
     if(rows.some(r=>r.moving)){remote=await this.#remoteInventory();rows=await this.#all();inventoryCheckedAt=Date.now();}
+    const compatible=rows.filter(row=>row.directory&&row.conflict&&remote.get(row.path)?.directory===true);
+    if(compatible.length){
+      for(const row of compatible)await this.#restoreCompatibleDirectory(row,remote.get(row.path),scan);
+      // Both successful restoration and a lost CAS require current rows before
+      // classifying pending intent; never reuse the conflicted snapshot here.
+      rows=await this.#all();this.#check();
+    }
     // Create parents before children; remove children before parents.
     const dirty=rows.filter(r=>r.dirty&&!r.conflict&&!r.moving).sort((a,b)=>(a.deleted?1:0)-(b.deleted?1:0)||(a.deleted?b.path.length-a.path.length:a.path.length-b.path.length));
     for(let index=0;index<dirty.length;index++){let row=dirty[index];this.#check();if(isContentRef(row.data))need(row.sha256===row.data.sha256,'Stored content metadata is inconsistent.');const existing=remote.get(row.path),target=row.path.slice(1);
@@ -435,7 +457,9 @@ export class MirroredFiles{
       if(reusable(path,row,item))continue;
       let value;try{if(canBatch&&!item.sha256&&!batchCache.has(path.slice(1))){const paths=[];let bytes=0;for(let i=index;i<entries.length&&paths.length<16;i++){const [other,record]=entries[i],r=local.get(other),relative=other.slice(1),length=new TextEncoder().encode(relative).length;if(record.directory||record.sha256||r?.dirty||reusable(other,r,record)||batchCache.has(relative))continue;if(bytes+length>8192)break;paths.push(relative);bytes+=length;}if(paths.length){const values=await this.#server.versions(paths,{signal:this.#captureAbort.signal});this.#check();need(Array.isArray(values)&&values.length===paths.length,'Invalid batch file versions.');for(let i=0;i<paths.length;i++)batchCache.set(paths[i],values[i]);}}value=await version(path.slice(1),item);if(!row||row.sha256!==value.sha256){if(!('data' in value)){const expectedHash=value.sha256;value=await this.#readChanged(path,expectedHash,row);need(value?.sha256===expectedHash,'Remote file changed while downloading.');}this.#check();await this.#installRemote({path,version:row?.version??null},value);}const current=await this.#get(path);if(current&&!current.dirty&&!current.directory&&current.sha256===value.sha256)scan.checked.set(path,{version:current.version,sha256:current.sha256,checkedAt:Date.now(),attempt:scan.attempts});}catch(error){if(error?.status===429)throw error;issues.push('Could not sync '+path+': '+(error.message||'server file unavailable'));continue;}
     }
-    for(const row of fresh){if(row.dirty||remote.has(row.path))continue;if(row.directory&&fresh.some(child=>child.dirty&&child.path.startsWith(row.path+'/')))continue;await this.#update(row.path,current=>current&&!current.dirty&&current.version===row.version?[null,true]:[undefined,false]);}
+    const cleanupRows=await this.#all();this.#check();
+    const unresolvedDirectories=cleanupRows.filter(row=>row.directory&&row.conflict).map(row=>row.path);
+    for(const row of cleanupRows){if(row.dirty||remote.has(row.path)||unresolvedDirectories.some(path=>row.path===path||row.path.startsWith(path+'/')))continue;if(row.directory&&cleanupRows.some(child=>child.dirty&&child.path.startsWith(row.path+'/')))continue;await this.#update(row.path,current=>current&&!current.dirty&&current.version===row.version?[null,true]:[undefined,false]);}
     this.#changed();if(issues.length){
       // This pass reached the end: it is a completed partial scan, not a
       // rate-limited/interrupted frontier. Retry all paths next time so one
