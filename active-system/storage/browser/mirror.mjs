@@ -42,13 +42,13 @@ function abortable(task,signal){
 export class MirrorConflict extends Error{constructor(message='This file changed on another device. Choose which copy to keep.'){super(message);this.name='MirrorConflict';}}
 export class MirrorCommitUncertain extends Error{constructor(){super('Account changed after a local storage transaction committed. Reopen the original account and check the file before retrying.');this.name='MirrorCommitUncertain';}}
 export class MirroredFiles{
-  #scope;#server;#content;#valid;#captureAbort=new AbortController();#db;#opening;#running;#closed=false;#listeners=new Set();#timer;#retryMs;#rateFailures=0;#online;#visibility;#hasPending=true;#again=false;#lastError=null;#lastSynced=null;#checked=new Map();
+  #scope;#server;#content;#valid;#captureAbort=new AbortController();#db;#opening;#running;#closed=false;#listeners=new Set();#timer;#retryMs;#rateFailures=0;#online;#visibility;#hasPending=true;#nextScanRequest=null;#lastError=null;#scans={active:null,complete:null};
   constructor({scope,server,content=null,valid=()=>true,onChange=()=>{},retryMs=15000}={}){
     need(typeof scope==='string'&&scope.length>0&&scope.length<=512&&server&&typeof valid==='function'&&typeof onChange==='function','Authenticated file mirror required.');
     need(typeof retryMs==='number'&&Number.isFinite(retryMs)&&retryMs>=0,'Invalid sync retry interval.');
     this.#scope=scope;this.#server=server;this.#content=content;this.#valid=valid;this.#retryMs=retryMs;this.#listeners.add(onChange);
     this.#online=()=>{if(!this.#running)this.#queueSync();};globalThis.addEventListener?.('online',this.#online);
-    this.#visibility=()=>{if(this.#closed||!this.#retryMs)return;if(globalThis.document?.visibilityState==='visible'&&this.#lastSynced!==null&&Date.now()-this.#lastSynced>=this.#retryMs*2&&!this.#running&&globalThis.navigator?.onLine!==false)this.#queueSync();else this.#schedule();};globalThis.document?.addEventListener?.('visibilitychange',this.#visibility);
+    this.#visibility=()=>{if(this.#closed||!this.#retryMs)return;const checkedAt=this.#scans.complete?.oldestCheckAt;if(globalThis.document?.visibilityState==='visible'&&checkedAt!==undefined&&Date.now()-checkedAt>=this.#retryMs*2&&!this.#running&&globalThis.navigator?.onLine!==false)this.#queueSync();else this.#schedule();};globalThis.document?.addEventListener?.('visibilitychange',this.#visibility);
     this.#schedule();
   }
   // Spread retries after rate limits. Successful idle mirrors poll less often,
@@ -58,7 +58,7 @@ export class MirroredFiles{
     const idle=!this.#hasPending&&!this.#lastError,scale=idle?(globalThis.document?.visibilityState==='hidden'?16:4):1;
     const retry=Math.min(120000,this.#retryMs*2**Math.min(this.#rateFailures,8)),base=Math.min(240000,retry*scale);
     const delay=Math.max(1,Math.round(base*(0.8+0.4*Math.random())));
-    this.#timer=setTimeout(()=>{this.#timer=null;if(this.#closed)return;if(!this.#running&&globalThis.navigator?.onLine!==false)this.sync().catch(()=>{});else this.#schedule();},delay);
+    this.#timer=setTimeout(()=>{this.#timer=null;if(this.#closed)return;if(!this.#running&&globalThis.navigator?.onLine!==false)this.sync({continuation:true}).catch(()=>{});else this.#schedule();},delay);
   }
   #queueSync(){if(this.#closed)return;if(this.#running){this.sync().catch(()=>{});return;}if(this.#rateFailures&&this.#retryMs){if(!this.#timer)this.#schedule();return;}this.sync().catch(()=>{});}
   #check(){need(!this.#closed&&this.#valid(),'Account changed. Reopen your files.');}
@@ -162,7 +162,7 @@ export class MirroredFiles{
     path=filePath(path);const all=await this.#all();if(path!=='/'){const dir=all.find(r=>r.path===path&&!r.deleted);need(dir?.directory,'Folder not found.');}
     return {entries:all.filter(r=>(!r.deleted||r.conflict)&&parent(r.path)===path).sort((a,b)=>a.path.localeCompare(b.path)).map(r=>({path:r.path,name:name(r.path),directory:r.directory,bytes:r.directory?null:storedSize(r.data),version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced',canMove:!r.directory&&!r.deleted&&!r.conflict&&!r.moving&&!r.attempted&&((!r.dirty&&typeof r.base==='string')||(r.dirty&&r.base===null)),canReceiveMove:r.directory&&!r.deleted&&!r.conflict&&!r.moving&&((!r.dirty&&r.base==='dir')||(r.dirty&&r.base===null))}))};
   }
-  async status(){const all=await this.#all();return {pending:all.filter(r=>r.dirty&&!r.conflict).length,conflicts:all.filter(r=>r.conflict).length,error:this.#lastError,lastSynced:this.#lastSynced};}
+  async status(){const all=await this.#all(),complete=this.#scans.complete;return {pending:all.filter(r=>r.dirty&&!r.conflict).length,conflicts:all.filter(r=>r.conflict).length,error:this.#lastError,lastSynced:complete?.oldestCheckAt??null,verification:complete?{...complete}:null};}
   async stat(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');this.#check();return {bytes:storedSize(r.data),sha256:r.sha256,version:r.version,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
   async read(path){return this.#readBytes(path,MAX_FILE,null);}
   async #readBytes(path,maximumBytes,signal){
@@ -365,11 +365,11 @@ export class MirroredFiles{
     if(!row&&typeof this.#server.readBlob==='function')return this.#server.readBlob(path.slice(1),sha256,{signal:this.#captureAbort.signal});
     return this.#server.read(path.slice(1),{signal:this.#captureAbort.signal});
   }
-  async #pass(){
-    this.#check();const canVersion=typeof this.#server.supportsVersion==='function'&&typeof this.#server.version==='function'&&await this.#server.supportsVersion({signal:this.#captureAbort.signal});
+  async #pass(scan){
+    this.#check();scan.attempts++;const canVersion=typeof this.#server.supportsVersion==='function'&&typeof this.#server.version==='function'&&await this.#server.supportsVersion({signal:this.#captureAbort.signal});
     const canBatch=canVersion&&typeof this.#server.supportsVersionBatch==='function'&&typeof this.#server.versions==='function'&&await this.#server.supportsVersionBatch({signal:this.#captureAbort.signal}),batchCache=new Map();
     const version=async(path,item)=>item?.sha256?item:batchCache.get(path)??(canVersion?await this.#server.version(path,{signal:this.#captureAbort.signal}):await this.#server.read(path,{signal:this.#captureAbort.signal}));
-    let remote=await this.#remoteInventory(),rows=await this.#all();this.#check();
+    let remote=await this.#remoteInventory(),rows=await this.#all();this.#check();let inventoryCheckedAt=Date.now();
     // Recover an interrupted rename by checking both server paths and hashes.
     for(const source of rows.filter(r=>r.moving&&r.moveTo)){
       const destination=rows.find(r=>r.path===source.moveTo&&r.moving&&r.moveFrom===source.path);
@@ -382,7 +382,7 @@ export class MirroredFiles{
       await this.#finishMove(source,destination,{restore:true,conflict:changed});
       throw Error(changed?'The file changed on the server; resolve the conflict before moving.':'The destination already exists on the server.');
     }
-    if(rows.some(r=>r.moving)){remote=await this.#remoteInventory();rows=await this.#all();}
+    if(rows.some(r=>r.moving)){remote=await this.#remoteInventory();rows=await this.#all();inventoryCheckedAt=Date.now();}
     // Create parents before children; remove children before parents.
     const dirty=rows.filter(r=>r.dirty&&!r.conflict&&!r.moving).sort((a,b)=>(a.deleted?1:0)-(b.deleted?1:0)||(a.deleted?b.path.length-a.path.length:a.path.length-b.path.length));
     for(let index=0;index<dirty.length;index++){let row=dirty[index];this.#check();if(isContentRef(row.data))need(row.sha256===row.data.sha256,'Stored content metadata is inconsistent.');const existing=remote.get(row.path),target=row.path.slice(1);
@@ -401,13 +401,13 @@ export class MirroredFiles{
         const current=existing?await version(target,existing):null;this.#check();
         if(row.attempted&&row.attempted.base===row.base&&current?.sha256===row.attempted.sha256){
           const rebased=await this.#rebaseAttempt(row,current.sha256);this.#check();
-          if(!rebased){this.#again=true;continue;}row=rebased;
+          if(!rebased){this.#requestScan(true);continue;}row=rebased;
         }
         if(row.deleted){if(!current){await this.#ack(row,null,{remove:true});continue;}if(current.sha256!==row.base){await this.#conflict(row);continue;}await this.#server.remove(target,row.base,{signal:this.#captureAbort.signal});remote.delete(row.path);await this.#ack(row,null,{remove:true});}
         else if(current?.sha256===row.sha256)await this.#ack(row,row.sha256);
         else if((current?.sha256??null)!==row.base)await this.#conflict(row);
         else{
-          if(!await this.#rememberAttempt(row)){this.#again=true;continue;}
+          if(!await this.#rememberAttempt(row)){this.#requestScan(true);continue;}
           this.#check();const lease=await this.acquireSnapshot(row.path,{expected:row.version,signal:this.#captureAbort.signal});
           try{await this.#server.write(target,this.#server.acceptsBlobWrites===true?lease.data:new Uint8Array(await lease.data.arrayBuffer()),row.base,{signal:this.#captureAbort.signal});}
           finally{lease.release();}
@@ -418,24 +418,70 @@ export class MirroredFiles{
     // Re-read current local rows: an edit can arrive while the server is slow.
     const fresh=await this.#all(),local=new Map(fresh.map(r=>[r.path,r])),issues=[];
     const entries=[...remote];
+    const reusable=(path,row,item)=>{
+      const check=scan.checked.get(path);
+      if(!row||!check||check.version!==row.version||check.sha256!==row.sha256)return false;
+      // A fresh inventory hash can revalidate a prior visit cheaply. Without
+      // one, continuation retains historical progress, never a current hash.
+      if(item.sha256&&item.sha256!==check.sha256)return false;
+      if(item.sha256){check.checkedAt=inventoryCheckedAt;check.attempt=scan.attempts;}
+      return true;
+    };
     for(let index=0;index<entries.length;index++){const [path,item]=entries[index];this.#check();const row=local.get(path);if(row?.dirty)continue;
       if(item.directory){if(!row)await this.#install({path,version:null},{directory:true});else if(!row.directory)await this.#conflict({...row,dirty:true});continue;}
       if(row?.directory){await this.#conflict({...row,dirty:true});continue;}
-      // Keep verified progress only while a scan is incomplete. A local edit
-      // changes the row version and invalidates the entry. The next complete
-      // scan starts fresh, so external edits are still eventually discovered.
-      if(row&&this.#checked.get(path)===row.version)continue;
-      let value;try{if(canBatch&&!item.sha256&&!batchCache.has(path.slice(1))){const paths=[];let bytes=0;for(let i=index;i<entries.length&&paths.length<16;i++){const [other,record]=entries[i],r=local.get(other),relative=other.slice(1),length=new TextEncoder().encode(relative).length;if(record.directory||record.sha256||r?.dirty||(r&&this.#checked.get(other)===r.version)||batchCache.has(relative))continue;if(bytes+length>8192)break;paths.push(relative);bytes+=length;}if(paths.length){const values=await this.#server.versions(paths,{signal:this.#captureAbort.signal});this.#check();need(Array.isArray(values)&&values.length===paths.length,'Invalid batch file versions.');for(let i=0;i<paths.length;i++)batchCache.set(paths[i],values[i]);}}value=await version(path.slice(1),item);if(!row||row.sha256!==value.sha256){if(!('data' in value)){const expectedHash=value.sha256;value=await this.#readChanged(path,expectedHash,row);need(value?.sha256===expectedHash,'Remote file changed while downloading.');}this.#check();await this.#installRemote({path,version:row?.version??null},value);}const current=await this.#get(path);if(current&&!current.dirty&&!current.directory&&current.sha256===value.sha256)this.#checked.set(path,current.version);}catch(error){if(error?.status===429)throw error;issues.push('Could not sync '+path+': '+(error.message||'server file unavailable'));continue;}
+      // Explicit continuations may retain verified earlier visits. Public
+      // sync() creates a fresh scan; it cannot inherit this progress cache.
+      if(reusable(path,row,item))continue;
+      let value;try{if(canBatch&&!item.sha256&&!batchCache.has(path.slice(1))){const paths=[];let bytes=0;for(let i=index;i<entries.length&&paths.length<16;i++){const [other,record]=entries[i],r=local.get(other),relative=other.slice(1),length=new TextEncoder().encode(relative).length;if(record.directory||record.sha256||r?.dirty||reusable(other,r,record)||batchCache.has(relative))continue;if(bytes+length>8192)break;paths.push(relative);bytes+=length;}if(paths.length){const values=await this.#server.versions(paths,{signal:this.#captureAbort.signal});this.#check();need(Array.isArray(values)&&values.length===paths.length,'Invalid batch file versions.');for(let i=0;i<paths.length;i++)batchCache.set(paths[i],values[i]);}}value=await version(path.slice(1),item);if(!row||row.sha256!==value.sha256){if(!('data' in value)){const expectedHash=value.sha256;value=await this.#readChanged(path,expectedHash,row);need(value?.sha256===expectedHash,'Remote file changed while downloading.');}this.#check();await this.#installRemote({path,version:row?.version??null},value);}const current=await this.#get(path);if(current&&!current.dirty&&!current.directory&&current.sha256===value.sha256)scan.checked.set(path,{version:current.version,sha256:current.sha256,checkedAt:Date.now(),attempt:scan.attempts});}catch(error){if(error?.status===429)throw error;issues.push('Could not sync '+path+': '+(error.message||'server file unavailable'));continue;}
     }
     for(const row of fresh){if(row.dirty||remote.has(row.path))continue;if(row.directory&&fresh.some(child=>child.dirty&&child.path.startsWith(row.path+'/')))continue;await this.#update(row.path,current=>current&&!current.dirty&&current.version===row.version?[null,true]:[undefined,false]);}
-    this.#changed();if(issues.length)throw Error(issues[0]+(issues.length>1?' (and '+(issues.length-1)+' other files)':''));this.#checked.clear();const remaining=await this.#all();this.#hasPending=remaining.some(r=>r.dirty&&!r.conflict);return {pending:remaining.filter(r=>r.dirty).length};
+    this.#changed();if(issues.length){
+      // This pass reached the end: it is a completed partial scan, not a
+      // rate-limited/interrupted frontier. Retry all paths next time so one
+      // unavailable file cannot indefinitely hide changes to healthy files.
+      if(this.#scans.active===scan)this.#scans.active=null;
+      throw Error(issues[0]+(issues.length>1?' (and '+(issues.length-1)+' other files)':''));
+    }
+    const remaining=await this.#all();this.#hasPending=remaining.some(r=>r.dirty&&!r.conflict);
+    const current=new Map(remaining.map(row=>[row.path,row]));
+    const checks=[...scan.checked].filter(([path,check])=>remote.has(path)&&current.get(path)?.version===check.version&&!current.get(path).dirty).map(([,check])=>check);
+    const verification=Object.freeze({startedAt:scan.startedAt,completedAt:Date.now(),oldestCheckAt:Math.min(inventoryCheckedAt,...checks.map(check=>check.checkedAt)),attempts:scan.attempts,filesChecked:checks.length,historicalChecks:checks.filter(check=>check.attempt!==scan.attempts).length});
+    this.#scans.complete=verification;if(this.#scans.active===scan)this.#scans.active=null;
+    return {pending:remaining.filter(r=>r.dirty).length,verification};
   }
   #exclusive(operation){
     const invalid=new AbortController(),timer=setInterval(()=>{try{this.#check()}catch{invalid.abort();this.#captureAbort.abort()}},100);
     const signal=AbortSignal.any([this.#captureAbort.signal,invalid.signal]);
     return serializeLocal(this.#scope,()=>{const locks=globalThis.navigator?.locks;return locks?.request?locks.request('codi-mirror:'+this.#scope,{mode:'exclusive',signal},operation):operation();},signal).finally(()=>clearInterval(timer));
   }
-  sync(){this.#check();if(this.#running){this.#again=true;return this.#running;}const run=async()=>{let result;do{this.#again=false;result=await this.#pass();}while(this.#again&&!this.#closed&&this.#valid());return result;};const task=this.#exclusive(run).then(result=>{this.#rateFailures=0;this.#lastError=null;this.#lastSynced=Date.now();this.#changed();return result;},error=>{if(!this.#closed){if(error?.status===429)this.#rateFailures=Math.min(this.#rateFailures+1,8);else this.#rateFailures=0;this.#lastError=error.message||'Server sync unavailable.';this.#changed();}throw error;}).finally(()=>{const repeat=this.#again;this.#again=false;if(this.#running===task)this.#running=null;this.#schedule();if(repeat&&!this.#rateFailures&&!this.#closed&&this.#valid())this.sync().catch(()=>{});});this.#running=task;return task;}
+  #requestScan(continuation){if(!continuation||this.#nextScanRequest===null)this.#nextScanRequest=continuation?'continue':'fresh';}
+  sync({continuation=false}={}){
+    this.#check();need(typeof continuation==='boolean','Invalid sync continuation request.');
+    this.#requestScan(continuation);
+    if(this.#running)return this.#running;
+    const run=async()=>{
+      let result;
+      do{
+        const request=this.#nextScanRequest??'continue';this.#nextScanRequest=null;
+        if(request==='fresh'||!this.#scans.active)this.#scans.active={startedAt:Date.now(),attempts:0,checked:new Map()};
+        result=await this.#pass(this.#scans.active);
+      }while(this.#nextScanRequest!==null&&!this.#closed&&this.#valid());
+      return result;
+    };
+    const task=this.#exclusive(run).then(result=>{
+      this.#rateFailures=0;this.#lastError=null;this.#changed();return result;
+    },error=>{
+      if(!this.#closed){if(error?.status===429)this.#rateFailures=Math.min(this.#rateFailures+1,8);else this.#rateFailures=0;this.#lastError=error.message||'Server sync unavailable.';this.#changed();}throw error;
+    }).finally(()=>{
+      if(this.#running===task)this.#running=null;
+      this.#schedule();
+      if(this.#nextScanRequest!==null&&!this.#rateFailures&&!this.#closed&&this.#valid()){
+        const continuation=this.#nextScanRequest==='continue';this.#nextScanRequest=null;this.sync({continuation}).catch(()=>{});
+      }
+    });
+    this.#running=task;return task;
+  }
   async resolve(path,choice,expected,internal=null){if(this.#content&&internal!==PUBLICATION_LOCKED)return this.#withPublicationLock(()=>this.resolve(path,choice,expected,PUBLICATION_LOCKED));this.#check();const stopValidity=this.#watchValidity();try{path=filePath(path);need(['local','server'].includes(choice),'Choose which copy to keep.');const row=await this.#get(path);if(!row||!row.conflict||row.version!==expected)throw new MirrorConflict('This item changed; reload before resolving.');need(!row.directory,'Folder conflicts require manual resolution.');
     const inventory=await this.#remoteInventory(),entry=inventory.get(path);need(!entry?.directory,'The server has a folder at this path.');const remote=entry?await this.#server.read(path.slice(1),{signal:this.#captureAbort.signal}):null;this.#check();
     if(choice==='local'){await this.#update(path,current=>{if(!current||current.version!==expected)throw new MirrorConflict();return [{...current,base:remote?.sha256??null,attempted:null,conflict:false,dirty:true},true];});}
@@ -447,5 +493,5 @@ export class MirroredFiles{
   }
   async persistence(){return {supported:typeof navigator.storage?.persist==='function'&&typeof navigator.storage?.persisted==='function',persistent:typeof navigator.storage?.persisted==='function'&&await navigator.storage.persisted()===true};}
   async requestPersistence(){need(navigator.userActivation?.isActive,'Use the storage protection button.');need(typeof navigator.storage?.persist==='function','Storage protection is unavailable.');await navigator.storage.persist();return this.persistence();}
-  close(){if(this.#closed)return;this.#closed=true;this.#captureAbort.abort();this.#content?.close?.();clearTimeout(this.#timer);globalThis.removeEventListener?.('online',this.#online);globalThis.document?.removeEventListener?.('visibilitychange',this.#visibility);this.#listeners.clear();this.#checked.clear();this.#db?.close();this.#db=null;}
+  close(){if(this.#closed)return;this.#closed=true;this.#captureAbort.abort();this.#content?.close?.();clearTimeout(this.#timer);globalThis.removeEventListener?.('online',this.#online);globalThis.document?.removeEventListener?.('visibilitychange',this.#visibility);this.#listeners.clear();this.#scans.active=null;this.#nextScanRequest=null;this.#db?.close();this.#db=null;}
 }
