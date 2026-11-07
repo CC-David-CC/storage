@@ -3,6 +3,8 @@ import {isContentRef} from './verified-content.mjs';
  * authorized operations; this module never sends a file to another origin. */
 const MAX_FILE=128*1024*1024, MAX_ENTRIES=4096;
 const need=(value,message)=>{if(!value)throw Error(message);};
+const nativeAborted=Function.call.bind(Object.getOwnPropertyDescriptor(AbortSignal.prototype,'aborted').get);
+const listenAbort=Function.call.bind(EventTarget.prototype.addEventListener),unlistenAbort=Function.call.bind(EventTarget.prototype.removeEventListener);
 export function filePath(value){
   need(typeof value==='string'&&new TextEncoder().encode(value).length<=2048&&value.startsWith('/'),'Use an absolute file path.');
   if(value==='/')return value;
@@ -94,6 +96,50 @@ export class MirroredFiles{
   }
   async #all(){return this.#tx('readonly',(store,done,fail)=>{const request=store.index('scope').getAll(this.#scope);request.onsuccess=()=>done(request.result);request.onerror=()=>fail(request.error);});}
   async #get(path){const row=await this.#tx('readonly',(store,done,fail)=>{const request=store.get([this.#scope,path]);request.onsuccess=()=>done(request.result||null);request.onerror=()=>fail(request.error);});if(isContentRef(row?.data))need(row.sha256===row.data.sha256,'Stored content metadata is inconsistent.');return row;}
+  // A cold local miss is not yet an authoritative negative lookup. Cached
+  // rows stay immediate/offline-first; a miss observes the shared sync and
+  // resolves as soon as that target installs, not after unrelated downloads.
+  async #lookupForRead(path,signal=null){
+    const row=await abortable(this.#get(path),signal);this.#check();if(signal?.aborted)throw new DOMException('Cancelled','AbortError');
+    if(row)return row;
+    let task=this.#running;
+    if(!task){
+      if(this.#scans.complete)return null;
+      if(this.#lastError!==null)throw Object.assign(Error('Account files have not finished initial synchronization: '+this.#lastError),{code:'MIRROR_NOT_READY'});
+      task=this.sync({continuation:true});
+    }
+    return new Promise((resolve,reject)=>{
+      let done=false,checking=false,again=false,syncDone=false,syncFailure=null,unsubscribe=null;
+      const subscriptions=[],signals=[this.#captureAbort.signal,...(signal?[signal]:[])];
+      const finish=(error,value,failed=true)=>{
+        if(done)return;done=true;let cleanup=null;
+        const clean=action=>{try{action();}catch(cause){if(cleanup===null)cleanup={cause};}};
+        if(unsubscribe)clean(unsubscribe);
+        for(const current of subscriptions)clean(()=>unlistenAbort(current,'abort',cancel));
+        if(cleanup!==null)reject(Object.assign(Error('File readiness listener cleanup failed.'),{code:'MIRROR_READINESS_CLEANUP_FAILED',cause:cleanup.cause,operationError:error,operationFailed:failed}));
+        else if(failed)reject(error);else resolve(value);
+      };
+      const cancel=()=>finish(new DOMException('File lookup was cancelled or its account closed.','AbortError'));
+      const probe=async()=>{
+        if(done)return;if(checking){again=true;return;}checking=true;
+        try{
+          do{
+            again=false;this.#check();if(signals.some(nativeAborted))throw new DOMException('Cancelled','AbortError');
+            const current=await this.#get(path);this.#check();if(signals.some(nativeAborted))throw new DOMException('Cancelled','AbortError');
+            if(current){finish(null,current,false);return;}
+            if(syncDone){if(syncFailure!==null)throw syncFailure.cause;need(this.#scans.complete,'Account files have not finished initial synchronization.');finish(null,null,false);return;}
+          }while(again&&!done);
+        }catch(error){finish(error);}finally{checking=false;}
+      };
+      try{
+        unsubscribe=this.subscribe(()=>{void probe();});
+        for(const current of signals){subscriptions.push(current);listenAbort(current,'abort',cancel,{once:true});}
+        // Subscribe before the second lookup, closing the install/listen gap.
+        Promise.resolve(task).then(()=>{syncDone=true;void probe();},cause=>{syncDone=true;syncFailure={cause};void probe();});
+        void probe();
+      }catch(error){finish(error);}
+    });
+  }
   async #update(path,fn){return this.#tx('readwrite',(store,done,fail)=>{const request=store.get([this.#scope,path]);request.onsuccess=()=>{try{this.#check();const [next,result]=fn(request.result||null);if(next===null)store.delete([this.#scope,path]);else if(next!==undefined)store.put(next);done(result);}catch(e){fail(e);}};request.onerror=()=>fail(request.error);});}
   // Validate hierarchy and write within one IndexedDB transaction across tabs.
   async #mutate(path,fn){return this.#tx('readwrite',(store,done,fail)=>{const request=store.index('scope').getAll(this.#scope);request.onsuccess=()=>{try{this.#check();const all=request.result,old=all.find(r=>r.path===path)||null;const [next,result]=fn(old,all);if(next===null)store.delete([this.#scope,path]);else if(next!==undefined)store.put(next);done(result);}catch(e){fail(e);}};request.onerror=()=>fail(request.error);});}
@@ -148,9 +194,10 @@ export class MirroredFiles{
     });
   }
   // Caller owns the returned lease and must release it after consuming data.
-  async acquireSnapshot(path,{signal=null,expected=null}={}){
+  async acquireSnapshot(path,options={}){return this.#acquireSnapshot(path,options,true);}
+  async #acquireSnapshot(path,{signal=null,expected=null}={},hydrate=false){
     path=filePath(path);if(signal?.aborted)throw new DOMException('Cancelled','AbortError');
-    const row=await abortable(this.#get(path),signal);need(row&&!row.deleted&&!row.directory,'File not found.');
+    const row=await (hydrate?this.#lookupForRead(path,signal):abortable(this.#get(path),signal));need(row&&!row.deleted&&!row.directory,'File not found.');
     if(expected!==null&&row.version!==expected)throw new MirrorConflict();
     let lease;
     if(isContentRef(row.data)){need(this.#content&&typeof this.#content.acquire==='function','Verified storage is unavailable.');const pending=this.#content.acquire(row.data,{signal});try{lease=await abortable(pending,signal)}catch(e){Promise.resolve(pending).then(value=>value?.release?.(),()=>{});throw e;}}
@@ -159,15 +206,15 @@ export class MirroredFiles{
     catch(e){lease.release();throw e;}
   }
   async list(path='/'){
-    path=filePath(path);const all=await this.#all();if(path!=='/'){const dir=all.find(r=>r.path===path&&!r.deleted);need(dir?.directory,'Folder not found.');}
+    path=filePath(path);if(path!=='/'){const dir=await this.#lookupForRead(path);need(dir&&!dir.deleted&&dir.directory,'Folder not found.');}const all=await this.#all();
     return {entries:all.filter(r=>(!r.deleted||r.conflict)&&parent(r.path)===path).sort((a,b)=>a.path.localeCompare(b.path)).map(r=>({path:r.path,name:name(r.path),directory:r.directory,bytes:r.directory?null:storedSize(r.data),version:r.version,deleted:r.deleted,status:r.conflict?'conflict':r.dirty?'pending':'synced',canMove:!r.directory&&!r.deleted&&!r.conflict&&!r.moving&&!r.attempted&&((!r.dirty&&typeof r.base==='string')||(r.dirty&&r.base===null)),canReceiveMove:r.directory&&!r.deleted&&!r.conflict&&!r.moving&&((!r.dirty&&r.base==='dir')||(r.dirty&&r.base===null))}))};
   }
   async status(){const all=await this.#all(),complete=this.#scans.complete;return {pending:all.filter(r=>r.dirty&&!r.conflict).length,conflicts:all.filter(r=>r.conflict).length,error:this.#lastError,lastSynced:complete?.oldestCheckAt??null,verification:complete?{...complete}:null};}
-  async stat(path){path=filePath(path);const r=await this.#get(path);need(r&&!r.deleted&&!r.directory,'File not found.');this.#check();return {bytes:storedSize(r.data),sha256:r.sha256,version:r.version,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
+  async stat(path,{signal=null}={}){path=filePath(path);const r=await this.#lookupForRead(path,signal);need(r&&!r.deleted&&!r.directory,'File not found.');this.#check();return {bytes:storedSize(r.data),sha256:r.sha256,version:r.version,status:r.conflict?'conflict':r.dirty?'pending':'synced'};}
   async read(path){return this.#readBytes(path,MAX_FILE,null);}
   async #readBytes(path,maximumBytes,signal){
     path=filePath(path);if(signal?.aborted)throw new DOMException('Cancelled','AbortError');
-    const r=await abortable(this.#get(path),signal);need(r&&!r.deleted&&!r.directory,'File not found.');
+    const r=await this.#lookupForRead(path,signal);need(r&&!r.deleted&&!r.directory,'File not found.');
     need(storedSize(r.data)<=maximumBytes,'This file exceeds the allowed size.');
     const combined=signal?AbortSignal.any([signal,this.#captureAbort.signal]):this.#captureAbort.signal;
     const lease=await this.acquireSnapshot(path,{expected:r.version,signal:combined});
@@ -182,7 +229,7 @@ export class MirroredFiles{
     path=filePath(path);
     const combined=signal?AbortSignal.any([signal,this.#captureAbort.signal]):this.#captureAbort.signal;
     const check=()=>{this.#check();if(combined.aborted)throw new DOMException('Cancelled','AbortError');};
-    check();const r=await abortable(this.#get(path),combined);check();
+    check();const r=await this.#lookupForRead(path,combined);check();
     need(r&&!r.deleted&&!r.directory,'File not found.');
     if(isContentRef(r.data)){
       // The copy owns its generation lease until it finishes or its worker is
@@ -368,7 +415,7 @@ export class MirroredFiles{
       return [{...current,conflict:false,version:crypto.randomUUID()},true];
     });
   }
-  async #install(row,remote){await this.#update(row.path,current=>{if(row.version===null?!!current:!current||current.version!==row.version||current.dirty)return [undefined,false];return [{scope:this.#scope,path:row.path,directory:remote.directory,data:remote.data??null,sha256:remote.sha256??null,base:remote.directory?'dir':remote.sha256,version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false},true];});}
+  async #install(row,remote){const installed=await this.#update(row.path,current=>{if(row.version===null?!!current:!current||current.version!==row.version||current.dirty)return [undefined,false];return [{scope:this.#scope,path:row.path,directory:remote.directory,data:remote.data??null,sha256:remote.sha256??null,base:remote.directory?'dir':remote.sha256,version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false},true];});if(installed)this.#changed();return installed;}
   async #installRemote(row,value){
     if(!this.#content)return this.#install(row,{directory:false,data:new Blob([value.data]),sha256:value.sha256});
     return this.#withPublicationLock(async()=>{
@@ -379,7 +426,7 @@ export class MirroredFiles{
   }
   async #readChanged(path,sha256,row){
     if(row?.data&&(row.data instanceof Blob||isContentRef(row.data))&&typeof this.#server.readChunked==='function'){
-      const lease=await this.acquireSnapshot(path,{expected:row.version,signal:this.#captureAbort.signal});
+      const lease=await this.#acquireSnapshot(path,{expected:row.version,signal:this.#captureAbort.signal},false);
       try{return await this.#server.readChunked(path.slice(1),sha256,lease.data,{signal:this.#captureAbort.signal});}
       finally{lease.release();}
     }
@@ -468,7 +515,7 @@ export class MirroredFiles{
         else if((current?.sha256??null)!==row.base)await this.#conflict(row);
         else{
           if(!await this.#rememberAttempt(row)){this.#requestScan(true);continue;}
-          this.#check();const lease=await this.acquireSnapshot(row.path,{expected:row.version,signal:this.#captureAbort.signal});
+          this.#check();const lease=await this.#acquireSnapshot(row.path,{expected:row.version,signal:this.#captureAbort.signal},false);
           try{await this.#server.write(target,this.#server.acceptsBlobWrites===true?lease.data:new Uint8Array(await lease.data.arrayBuffer()),row.base,{signal:this.#captureAbort.signal});}
           finally{lease.release();}
           remote.set(row.path,{directory:false,sha256:row.sha256});await this.#ack(row,row.sha256);

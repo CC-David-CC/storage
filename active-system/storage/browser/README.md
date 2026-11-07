@@ -13,8 +13,29 @@ request; each write or deletion still checks its own expected server hash.
 The current issuer file-authorization limit is shared behind the reverse proxy;
 these client changes reduce load but do not establish 100-user capacity.
 
-`stat(path)` reports the local file version, hash, status and size without
-materializing its contents; applications may use it to detect changes.
+`stat(path, {signal} = {})` reports local version/hash/status/size. Cached
+rows remain immediate/offline-first without fetching bytes. An absent local row
+during initial/in-progress hydration is not yet a reliable negative lookup. File
+reads, leased snapshots, Blob reads, stat and missing non-root folder lookups join
+that shared sync. They resolve as soon as the verified target row installs,
+without waiting for unrelated files or claiming the full account is synced.
+
+Existing mirror notifications now report each committed remote install. A
+readiness waiter subscribes, then rechecks to close the install/listen gap,
+coalesces pending IDB probes and releases listeners on success/error/cancellation.
+The shared sync continues independently. A target installed by a partial pass
+can be read even if another file fails. If it remains absent, hydration failures
+propagate instead of a false File not found. Failed initial reads do not bypass
+retry/rate-limit backoff; explicit manual sync can retry. Account closure cancels
+all waits; caller signals stop only their own wait. Existing callers without
+signals remain compatible. Internal uploads/delta reads use local-only snapshots
+and cannot wait on their own hydration pass.
+
+No per-app sleep, retry or dummy write is required. Initial hydration still uses
+the existing authorized sync/verification path and may download file bodies.
+An idle mirror with a completed scan retains local-first semantics; this is not
+a promise of a fresh server inventory on every read. Local deletion/conflict and
+pending-write intent remain authoritative.
 
 `acquireSnapshot(path, {signal, expected})` returns
 `{data, version, sha256, status, release}` for large-file consumers. Always call
