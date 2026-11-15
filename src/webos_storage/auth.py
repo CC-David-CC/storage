@@ -17,11 +17,7 @@ from webos_accounts import jose
 from .policy import Denied, Principal
 from .user_store import registered
 
-CONFIRMATION_TYPE = 'codi-gateway-identity+jwt'
-USE_TYPE = 'codi-gateway-use+jws'
-AUTHORIZE = '/api/v1/gateway/authorize'
-CHALLENGE = '/api/v1/gateway/challenge'
-LIFETIME = 30
+from webos_runtime.file_protocol import CONFIRMATION_TYPE, USE_TYPE, AUTHORIZE, CHALLENGE, LIFETIME, gateway_context as context
 MAX_REQUEST_BYTES = 192 * 1024 * 1024
 
 @dataclass(frozen=True)
@@ -47,14 +43,6 @@ TABLES = {
     'gateway_challenges': 'CREATE TABLE gateway_challenges (nonce TEXT PRIMARY KEY, key_thumb TEXT NOT NULL, request_sha TEXT NOT NULL, expires INTEGER NOT NULL)',
     'gateway_used_grants': 'CREATE TABLE gateway_used_grants (id TEXT PRIMARY KEY, expires INTEGER NOT NULL)',
 }
-
-def context(origin, base_path=''):
-    u = urlsplit(origin)
-    if not u.hostname or u.username or u.password or u.path or u.query or u.fragment or origin != u.geturl() or (u.scheme != 'https' and not (u.scheme == 'http' and u.hostname == '127.0.0.1')):
-        raise ValueError('Explicit HTTPS or loopback gateway origin required')
-    if not isinstance(base_path, str) or base_path and not re.fullmatch(r'(?:/[A-Za-z0-9_-]+)+', base_path):
-        raise ValueError('Canonical gateway mount required')
-    return origin + base_path + '/gateway', base_path + '/gateway/use'
 
 def digest(value):
     if not isinstance(value, str) or not re.fullmatch('[A-Za-z0-9_-]{43}', value) or len(jose.unb64(value)) != 32:

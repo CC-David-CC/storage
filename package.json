@@ -1,0 +1,12 @@
+{
+  "name": "@webos/storage",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/webos_storage/client.mjs"
+  },
+  "dependencies": {
+    "@webos/accounts": "0.1.0"
+  }
+}

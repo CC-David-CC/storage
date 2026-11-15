@@ -1,6 +1,5 @@
 /** Account files over same-origin HTTPS. Never sends credentials to another URL. */
-import {hash,signJws,inspectJws,verifyJws,sameKey,validateTimes,nowSeconds,requireThat} from '../network/crypto.mjs';
-import {verifyIdentity,PROOF_TYPE} from '../network/identity.mjs';
+import {hash, requireThat} from '@webos/accounts/crypto';
 
 const MAX_FILE=128*1024*1024,MAX_RESPONSE=192*1024*1024;
 export class FileRequestError extends Error{
@@ -34,9 +33,9 @@ function decode(text){
 const DELTA_BLOCK=64*1024, DELTA_MOD=65521, DELTA_MAX_OPS=8192, DELTA_MAX_FAILED_HASHES=64;
 const hexDigest=async bytes=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(b=>b.toString(16).padStart(2,'0')).join('');
 // Each file operation owns its worker. Session changes and aborts terminate it.
-async function runFileWorker(operation,blob,check=()=>{},signal=null,extra={}){
+async function runFileWorker(workerUrl,operation,blob,check=()=>{},signal=null,extra={}){
   check();if(signal?.aborted)throw new DOMException('Cancelled','AbortError');
-  const worker=new Worker(new URL('./hash/verify-worker.mjs',import.meta.url),{type:'module',name:'codi-file-verify'});
+  const worker=new Worker(workerUrl,{type:'module',name:'codi-file-verify'});
   try{return await new Promise((resolve,reject)=>{
     let settled=false;const finish=(error,value)=>{if(settled)return;settled=true;clearInterval(timer);signal?.removeEventListener('abort',abort);error?reject(error):resolve(value);};
     const abort=()=>finish(new DOMException('Cancelled','AbortError'));
@@ -50,25 +49,24 @@ async function runFileWorker(operation,blob,check=()=>{},signal=null,extra={}){
   })}finally{worker.terminate()}
 }
 export class UserFiles{
-  constructor(config,session,{sessionValid=()=>true}={}){
-    const api=config?.identity?.apiBase,base=config?.gateway?.basePath;
-    requireThat(config?.identity?.mode==='server'&&config.identity.issuer===location.origin,'Same-origin issuer required');
-    requireThat(typeof api==='string'&&/^\/(?:[A-Za-z0-9_-]+\/)*api\/v1$/.test(api),'Canonical issuer API required');
-    requireThat(config.gateway.version==='codi-user-files/1'&&base===api.slice(0,-7)+'/gateway','Same-origin file gateway required');
-    this.config=config;this.session=session;this.valid=sessionValid;this.base=base;this.api=api;
+  constructor(authority,{workerUrl=new URL('./vendor/js-sha256/verify-worker.mjs',import.meta.url)}={}){
+    requireThat(authority&&typeof authority.check==='function'&&typeof authority.authorize==='function','Authoritative account-files capability required');
+    const url=new URL(workerUrl,location.href);requireThat(url.origin===location.origin,'Same-origin verification worker required');
+    this.authority=authority;this.base=authority.basePath;this.workerUrl=url;
+    this.check();
   }
-  check(){requireThat(this.valid()&&this.session.public.kind==='registered','Sign in to access your server files');}
+  check(){this.authority.check();}
   get acceptsBlobWrites(){return true;}
   async captureSnapshot(blob,{signal=null}={}){
     const check=()=>{this.check();if(signal?.aborted)throw new DOMException('Cancelled','AbortError')};check();
     requireThat(['[object Blob]','[object File]'].includes(Object.prototype.toString.call(blob))&&Number.isSafeInteger(blob.size)&&blob.size>=0&&blob.size<=MAX_FILE,'Files are limited to 128 MiB');
-    const result=await runFileWorker('capture',blob,check,signal);check();
+    const result=await runFileWorker(this.workerUrl,'capture',blob,check,signal);check();
     requireThat(result&&result.blob instanceof Blob&&result.blob.size===blob.size&&typeof result.sha256==='string'&&/^[0-9a-f]{64}$/.test(result.sha256),'Invalid captured file');return result;
   }
-  async post(path,body,{token=null,headers={},timeout=15000}={}){
+  async post(path,body,{headers={},timeout=15000}={}){
     this.check();
     const response=await fetch(path,{method:'POST',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:'no-referrer',
-      headers:{'Content-Type':'application/json',...(token?{Authorization:'Codi '+token}:{}),...headers},body,signal:AbortSignal.timeout(timeout)});
+      headers:{'Content-Type':'application/json',...headers},body,signal:AbortSignal.timeout(timeout)});
     const reader=response.body.getReader(),chunks=[];let size=0;
     try{
       while(true){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>MAX_RESPONSE)throw Error('File response too large');chunks.push(value);}
@@ -93,27 +91,12 @@ export class UserFiles{
     this.check();requireThat(offset===size&&await hexDigest(data)===sha256,'Binary file integrity check failed');this.check();return {data,sha256};
   }
   async request(operation,fields={},binary=null,binaryResponse=false){
-    this.check();const session=this.session,sid=session.public.sid,publicKey=session.public.key,key=session.privateKey;
-    await verifyIdentity(session.public,this.config.identity);this.check();
+    this.check();
     const raw=JSON.stringify({resource:'my-files',operation,...fields});requireThat(new TextEncoder().encode(raw).length<=MAX_RESPONSE,'File request too large');
     const requestSha=await hash(raw);
-    const challenge=await this.post(this.base+'/challenge',JSON.stringify({key:publicKey,request_sha256:requestSha}));
+    const challenge=await this.post(this.base+'/challenge',JSON.stringify({key:this.authority.publicKey,request_sha256:requestSha}));
     requireThat(typeof challenge.nonce==='string'&&/^[A-Za-z0-9_-]{43}$/.test(challenge.nonce)&&challenge.request_sha256===requestSha,'Invalid gateway challenge');
-    const authorize=this.api+'/gateway/authorize';
-    const issuerNonce=await this.post(this.api+'/gateway/challenge',JSON.stringify({key:publicKey,path:authorize}),{token:session.token});
-    const signedRequest=JSON.stringify({nonce:challenge.nonce,request_sha256:requestSha}),now=nowSeconds();
-    const issuerProof=await signJws({v:1,nonce:issuerNonce.nonce,iss:sid,aud:this.config.identity.issuer,method:'POST',path:authorize,iat:now,exp:now+60,request_sha256:await hash(signedRequest)},key,PROOF_TYPE);
-    const result=await this.post(authorize,JSON.stringify({request:signedRequest,proof:issuerProof}),{token:session.token});
-    const inspected=inspectJws(result.confirmation,'codi-gateway-identity+jwt',8192);
-    const authority=this.config.identity.authorityKeys.find(k=>k.kid===inspected.header.kid);requireThat(authority,'Unknown file authorization authority');
-    const c=await verifyJws(result.confirmation,authority.jwk,'codi-gateway-identity+jwt',8192);validateTimes(c,30);
-    const audience=location.origin+this.base;
-    requireThat(c.v===1&&c.iss===this.config.identity.issuer&&c.aud===audience&&c.sid===sid&&c.sub===session.public.sub&&c.kind==='registered'&&sameKey(c.cnf?.jwk,publicKey)&&c.nonce===challenge.nonce&&c.request_sha256===requestSha,'File authorization context changed');
-    this.check();requireThat(session.public.sid===sid,'File session changed');
-    // The verified issuer time also works when the device clock is slightly
-    // ahead; the proof still cannot outlive this exact short-lived grant.
-    const proof=await signJws({v:1,iss:sid,aud:audience,nonce:challenge.nonce,grant_sha256:await hash(result.confirmation),request_sha256:requestSha,method:'POST',path:this.base+'/use',iat:c.iat,exp:c.exp},key,'codi-gateway-use+jws');
-    const authorization='Codi-File '+result.confirmation+' '+proof;
+    const authorization=await this.authority.authorize(challenge.nonce,requestSha);this.check();
     if(binary!==null){
       requireThat((binary instanceof Uint8Array&&binary.length<=MAX_FILE)||(binary instanceof Blob&&binary.size<=MAX_FILE),'Invalid binary upload');
       const metadata=new TextEncoder().encode(raw);requireThat(metadata.length<=8192,'Upload metadata too large');
@@ -177,13 +160,13 @@ export class UserFiles{
     const capText=await cap.text();check();requireThat(capText.length<=1024,'Invalid chunk capability');let supported;try{supported=JSON.parse(capText)}catch{throw Error('Invalid chunk capability')}requireThat(supported?.version==='codi-file-chunks/1'&&supported.maxBytes===MAX_FILE,'Invalid chunk capability');
     const m=await this.request('chunk-manifest-v1',{path,previousSHA256:expected});check();
     requireThat(m?.version==='codi-file-chunks/1'&&m.sha256===expected&&Number.isSafeInteger(m.size)&&m.size>=0&&m.size<=MAX_FILE&&Array.isArray(m.chunks)&&m.chunks.length<=8193,'Invalid chunk manifest');
-    const local=await runFileWorker('chunks',previous,check,signal);check();requireThat(Array.isArray(local)&&local.length<=8193,'Invalid local chunk list');let localOffset=0;const lookup=new Map();for(const c of local){requireThat(Array.isArray(c)&&c.length===3&&c[0]===localOffset&&Number.isSafeInteger(c[1])&&c[1]>0&&c[1]<=262144&&typeof c[2]==='string'&&/^[0-9a-f]{64}$/.test(c[2])&&c[0]+c[1]<=previous.size,'Invalid local chunk');lookup.set(c[2]+':'+c[1],previous.slice(c[0],c[0]+c[1]));localOffset+=c[1]}requireThat(localOffset===previous.size,'Incomplete local chunks');let position=0;const parts=[];
+    const local=await runFileWorker(this.workerUrl,'chunks',previous,check,signal);check();requireThat(Array.isArray(local)&&local.length<=8193,'Invalid local chunk list');let localOffset=0;const lookup=new Map();for(const c of local){requireThat(Array.isArray(c)&&c.length===3&&c[0]===localOffset&&Number.isSafeInteger(c[1])&&c[1]>0&&c[1]<=262144&&typeof c[2]==='string'&&/^[0-9a-f]{64}$/.test(c[2])&&c[0]+c[1]<=previous.size,'Invalid local chunk');lookup.set(c[2]+':'+c[1],previous.slice(c[0],c[0]+c[1]));localOffset+=c[1]}requireThat(localOffset===previous.size,'Incomplete local chunks');let position=0;const parts=[];
     for(const entry of m.chunks){requireThat(Array.isArray(entry)&&entry.length===3&&entry[0]===position&&Number.isSafeInteger(entry[1])&&entry[1]>0&&entry[1]<=262144&&typeof entry[2]==='string'&&/^[0-9a-f]{64}$/.test(entry[2])&&position+entry[1]<=m.size,'Invalid chunk entry');
       const [offset,length,sha]=entry;let data=lookup.get(sha+':'+length);
       if(!data){const result=await this.request('chunk-read-v1',{path,previousSHA256:expected,offset,length,chunkSHA256:sha});check();requireThat(result?.offset===offset&&result.length===length&&result.sha256===sha&&typeof result.data==='string'&&result.data.length===Math.ceil(length/3)*4,'Invalid chunk response');const bytes=decode(result.data);requireThat(bytes.length===length&&await hexDigest(bytes)===sha,'Chunk integrity check failed');check();data=new Blob([bytes]);}
       parts.push(data);position+=length;
     }
-    requireThat(position===m.size,'Incomplete chunk manifest');const blob=new Blob(parts),actual=await runFileWorker('hash',blob,check,signal);check();requireThat(actual===expected,'File integrity check failed');return {data:blob,sha256:actual};
+    requireThat(position===m.size,'Incomplete chunk manifest');const blob=new Blob(parts),actual=await runFileWorker(this.workerUrl,'hash',blob,check,signal);check();requireThat(actual===expected,'File integrity check failed');return {data:blob,sha256:actual};
   }
   async read(path){
     this.check();const capability=await fetch(this.base+'/binary-read-capabilities',{method:'GET',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:'no-referrer',signal:AbortSignal.timeout(10000)});this.check();
@@ -222,13 +205,13 @@ export class UserFiles{
     if(previousSHA256!==null&&size>=2*DELTA_BLOCK&&await this.supportsDelta()){
       const signatures=await this.request('delta-signatures',{path,previousSHA256});check();
       requireThat(signatures?.sha256===previousSHA256,'Delta base version changed');
-      const result=await runFileWorker('delta',snapshot,check,signal,{signature:signatures});check();
+      const result=await runFileWorker(this.workerUrl,'delta',snapshot,check,signal,{signature:signatures});check();
       requireThat(result&&typeof result.sha256==='string'&&/^[0-9a-f]{64}$/.test(result.sha256)&&(result.patch===null||(result.patch instanceof Blob&&result.patch.size<size&&typeof result.patchSHA256==='string'&&/^[0-9a-f]{64}$/.test(result.patchSHA256))),'Invalid delta worker result');
       sha256=result.sha256;
       if(result.patch!==null)return this.request('replace-delta',{path,format:'codi-file-delta/1',size:size,sha256,previousSHA256,patchSize:result.patch.size,patchSHA256:result.patchSHA256},result.patch);
     }
     if(await this.supportsStreamingUpload()){
-      if(sha256===null)sha256=await runFileWorker('hash',snapshot,check,signal);check();requireThat(typeof sha256==='string'&&/^[0-9a-f]{64}$/.test(sha256),'Invalid file digest');
+      if(sha256===null)sha256=await runFileWorker(this.workerUrl,'hash',snapshot,check,signal);check();requireThat(typeof sha256==='string'&&/^[0-9a-f]{64}$/.test(sha256),'Invalid file digest');
       return this.request(operation,{path,format:'codi-binary-upload/1',size:size,sha256,...(previousSHA256===null?{}:{previousSHA256})},snapshot);
     }
     // Legacy JSON fallback still encodes on the main thread; not release-ready
