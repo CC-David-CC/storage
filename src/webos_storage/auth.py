@@ -13,8 +13,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent/'codiserver-server-v0.3.0'))
-from codiauth import jose
+from webos_accounts import jose
 from .policy import Denied, Principal
 from .user_store import registered
 
