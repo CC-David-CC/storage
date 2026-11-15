@@ -97,15 +97,25 @@ export class UserFiles{
     const challenge=await this.post(this.base+'/challenge',JSON.stringify({key:this.authority.publicKey,request_sha256:requestSha}));
     requireThat(typeof challenge.nonce==='string'&&/^[A-Za-z0-9_-]{43}$/.test(challenge.nonce)&&challenge.request_sha256===requestSha,'Invalid gateway challenge');
     const authorization=await this.authority.authorize(challenge.nonce,requestSha);this.check();
+    const mutating=['create','replace','replace-delta','mkdir','delete','rename','word-count'].includes(operation);
+    const dispatch=async action=>{
+      try{return await action();}
+      catch(error){
+        // A transport loss or 5xx after dispatch cannot prove a mutation failed.
+        // Do not automatically retry it or report an unconfirmed write as saved.
+        if(mutating&&(!(error instanceof FileRequestError)||error.status>=500))error.outcome='unknown';
+        throw error;
+      }
+    };
     if(binary!==null){
       requireThat((binary instanceof Uint8Array&&binary.length<=MAX_FILE)||(binary instanceof Blob&&binary.size<=MAX_FILE),'Invalid binary upload');
       const metadata=new TextEncoder().encode(raw);requireThat(metadata.length<=8192,'Upload metadata too large');
       const prefix=new Uint8Array(4);new DataView(prefix.buffer).setUint32(0,metadata.length,false);
       const body=new Blob([prefix,metadata,binary],{type:'application/octet-stream'});
-      return this.post(this.base+'/upload',body,{headers:{'Content-Type':'application/octet-stream',Authorization:authorization},timeout:910000});
+      return dispatch(()=>this.post(this.base+'/upload',body,{headers:{'Content-Type':'application/octet-stream',Authorization:authorization},timeout:910000}));
     }
     if(binaryResponse)return this.postBinary(this.base+'/use',raw,{Authorization:authorization});
-    return this.post(this.base+'/use',raw,{headers:{Authorization:authorization},timeout:910000});
+    return dispatch(()=>this.post(this.base+'/use',raw,{headers:{Authorization:authorization},timeout:910000}));
   }
   wordCount(path,previousSHA256){return this.request('word-count',{path,previousSHA256});}
   list(path=''){return this.request('list',{path});}
