@@ -1,0 +1,16 @@
+import assert from 'node:assert/strict';
+import {indexedDB,IDBKeyRange} from 'fake-indexeddb';
+import {MirroredFiles} from '../active-system/storage/browser/mirror.mjs';
+globalThis.indexedDB=indexedDB;globalThis.IDBKeyRange=IDBKeyRange;
+Object.defineProperty(globalThis,'navigator',{value:{locks:{request:async(_name,_options,fn)=>fn()}},configurable:true});
+const server={async list(){throw Error('offline')}},scope='metadata-migration',legacy=new MirroredFiles({scope,server,retryMs:0});
+const saved=await legacy.write('/pending','locally edited');await new Promise(r=>setTimeout(r,0));legacy.close();
+const db=await new Promise((res,rej)=>{const r=indexedDB.open('codi-mirrored-files-v1',1);r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)});
+const read=()=>new Promise((res,rej)=>{const tx=db.transaction('files','readonly'),q=tx.objectStore('files').get([scope,'/pending']);q.onsuccess=()=>res(q.result);q.onerror=()=>rej(q.error)});
+const original=await read();Object.assign(original,{base:'a'.repeat(64),attempted:{base:'a'.repeat(64),sha256:'b'.repeat(64)},dirty:true,conflict:true,moving:true,moveFrom:'/old'});
+await new Promise((res,rej)=>{const tx=db.transaction('files','readwrite');tx.objectStore('files').put(original);tx.oncomplete=res;tx.onerror=()=>rej(tx.error)});db.close();
+const content={async capture(blob){return {kind:'codi-opfs-content/1',path:'/content-'+crypto.randomUUID(),generation:crypto.randomUUID(),size:blob.size,sha256:original.sha256}},async read(){return new Blob(['locally edited'])},async acquire(ref){return {data:await this.read(ref),release(){}}}};
+const mirror=new MirroredFiles({scope,server,content,retryMs:0});await mirror.migrateContent('/pending',saved.version);
+const after=await new Promise((res,rej)=>{const open=indexedDB.open('codi-mirrored-files-v1',2);open.onsuccess=()=>{const d=open.result,tx=d.transaction('files','readonly'),q=tx.objectStore('files').get([scope,'/pending']);q.onsuccess=()=>{d.close();res(q.result)};q.onerror=()=>rej(q.error)};open.onerror=()=>rej(open.error)});
+const {data:beforeBytes,...beforeMeta}=original,{data:afterRef,...afterMeta}=after;assert.deepEqual(afterMeta,beforeMeta);assert.equal(afterRef.kind,'codi-opfs-content/1');assert.equal((await mirror.read('/pending')).status,'conflict');mirror.close();
+console.log('PASS migration preserves pending conflict and uncertain-write metadata');
