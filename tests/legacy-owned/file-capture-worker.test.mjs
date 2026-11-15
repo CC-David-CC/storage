@@ -1,4 +1,4 @@
-import assert from 'node:assert/strict';import {createHash} from 'node:crypto';import {captureBlob} from '../active-system/gateway_service/vendor/js-sha256/verify-worker.mjs';
+import assert from 'node:assert/strict';import {createHash} from 'node:crypto';import {captureBlob} from '../../src/webos_storage/vendor/js-sha256/verify-worker.mjs';
 for(const n of [0,1,262143,262144,262145,4*1024*1024+7]){
  const data=new Uint8Array(n);for(let i=0;i<n;i++)data[i]=(i*53+7)&255;const expected=createHash('sha256').update(data).digest('hex');
  let max=0,reads=0;const old=Blob.prototype.arrayBuffer;Blob.prototype.arrayBuffer=function(){reads++;max=Math.max(max,this.size);return old.call(this)};

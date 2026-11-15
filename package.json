@@ -8,5 +8,8 @@
   },
   "dependencies": {
     "@webos/accounts": "0.1.0"
+  },
+  "scripts": {
+    "test:owned-reference": "node --test --test-reporter=tap tests/legacy-owned/incremental-sha-vectors.test.mjs tests/legacy-owned/file-capture-worker.test.mjs tests/legacy-owned/chunk-sync-browser-vectors.test.mjs tests/legacy-owned/file-delta-collision-test.mjs tests/legacy-owned/upload-worker-delta-vectors.test.mjs"
   }
 }

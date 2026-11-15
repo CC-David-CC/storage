@@ -1,0 +1,5 @@
+# Owned reference tests
+
+Original test source and selected history are retained. Runnable tests under tests/legacy-owned/ change only source-module locators to this repository’s own original-byte modules; assertion AST is preserved. The Storage frozen chunk vectors are exact original synthetic data. npm run test:owned-reference runs only qualified cases where provided. Node unit tests with supplied Worker/popup doubles do not qualify a browser, guest, real account persistence or authorized-agent transport.
+
+Unported source remains inert under legacy/reference-tests/ with .source suffixes and is excluded from this command. Browser relay cases need a deliberate public Accounts/Runtime dependency port; no private cross-repo imports or implementation copies were added. The Desktop negative control is stale in the original captured snapshot: closeAccountMirror is absent from its supplied harness, so it fails before its intended cancellation assertion. It is retained unchanged, not treated as current behavior or a passing negative control. See parent migration/OWNED-NODE-REFERENCES.md and private phase56.

@@ -1,6 +1,6 @@
 import {readFile} from 'node:fs/promises';import {createHash} from 'node:crypto';import assert from 'node:assert/strict';
-import {sha256} from '../active-system/gateway_service/vendor/js-sha256/core.mjs';
-import {hashBlob} from '../active-system/gateway_service/vendor/js-sha256/verify-worker.mjs';
+import {sha256} from '../../src/webos_storage/vendor/js-sha256/core.mjs';
+import {hashBlob} from '../../src/webos_storage/vendor/js-sha256/verify-worker.mjs';
 for(const n of [0,1,3,55,56,63,64,65,127,128,129,262143,262144,262145,1048579]){const data=Buffer.alloc(n);for(let i=0;i<n;i++)data[i]=(i*71+13)&255;const expected=createHash('sha256').update(data).digest('hex');assert.equal(await hashBlob(new Blob([data])),expected,'length '+n)}
 assert.equal(await hashBlob(new Blob(['abc'])),'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
 const block=Buffer.alloc(65536,0xa5),native=createHash('sha256'),stream=sha256.create();for(let i=0;i<2048;i++){native.update(block);stream.update(block)}assert.equal(stream.hex(),native.digest('hex'),'128 MiB streamed vector');

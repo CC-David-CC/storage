@@ -1,5 +1,5 @@
 import {createHash,webcrypto} from 'node:crypto';import assert from 'node:assert/strict';
-import {deltaBlob} from '../active-system/gateway_service/vendor/js-sha256/verify-worker.mjs';
+import {deltaBlob} from '../../src/webos_storage/vendor/js-sha256/verify-worker.mjs';
 const block=65536,weak=787416541;let calls=0;
 const original=globalThis.crypto;Object.defineProperty(globalThis,'crypto',{configurable:true,value:{subtle:{digest(...args){calls++;return webcrypto.subtle.digest(...args)}}}});
 try{
