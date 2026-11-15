@@ -1,0 +1,177 @@
+{
+  "vectors": [
+    {
+      "input": "sha256-counter-u32be-v1",
+      "length": 0,
+      "manifest": {
+        "version": "codi-file-chunks/1",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "chunks": []
+      }
+    },
+    {
+      "input": "sha256-counter-u32be-v1",
+      "length": 100,
+      "manifest": {
+        "version": "codi-file-chunks/1",
+        "size": 100,
+        "sha256": "5dc953ef0b50b2db30f8591574d0ee6c15268ed54d96779620712881317c2702",
+        "chunks": [
+          [
+            0,
+            100,
+            "5dc953ef0b50b2db30f8591574d0ee6c15268ed54d96779620712881317c2702"
+          ]
+        ]
+      }
+    },
+    {
+      "input": "sha256-counter-u32be-v1",
+      "length": 262145,
+      "manifest": {
+        "version": "codi-file-chunks/1",
+        "size": 262145,
+        "sha256": "46a7c2b02c686f127c2fceda1077c83b5604f264731398ff3b121d639febe125",
+        "chunks": [
+          [
+            0,
+            50954,
+            "fa2a3343b632abdc4a90973f1a9b4eb5d98186dbb7078358552bcf0221255983"
+          ],
+          [
+            50954,
+            33769,
+            "a0cabf8aea5fae7121691a3151352be57aab84af1da3516525c2f736135c24f7"
+          ],
+          [
+            84723,
+            26316,
+            "545a1cc9d37f91744cc7c4bf7cdf3548fe45891bcae69c7bfc2ef2e63b86d221"
+          ],
+          [
+            111039,
+            24346,
+            "660f2fc729f12aaa5cc7adde565fe77b0d1a44b3ca51d540f314fea6a7a38d93"
+          ],
+          [
+            135385,
+            34754,
+            "bd35a8177d301af3101ba8dc05f33eb97bf3dc788f847992a444dae5b19d9735"
+          ],
+          [
+            170139,
+            92006,
+            "a3c317792643b27a9847842cc3f0705676f27f3cd278710dd55c313d318dca22"
+          ]
+        ]
+      }
+    },
+    {
+      "input": "sha256-counter-u32be-v1",
+      "length": 1048576,
+      "manifest": {
+        "version": "codi-file-chunks/1",
+        "size": 1048576,
+        "sha256": "bc429ebec07d28e0e3dc3de395f60122328e7803a0f90af372bb41e0e8989d0f",
+        "chunks": [
+          [
+            0,
+            50954,
+            "fa2a3343b632abdc4a90973f1a9b4eb5d98186dbb7078358552bcf0221255983"
+          ],
+          [
+            50954,
+            33769,
+            "a0cabf8aea5fae7121691a3151352be57aab84af1da3516525c2f736135c24f7"
+          ],
+          [
+            84723,
+            26316,
+            "545a1cc9d37f91744cc7c4bf7cdf3548fe45891bcae69c7bfc2ef2e63b86d221"
+          ],
+          [
+            111039,
+            24346,
+            "660f2fc729f12aaa5cc7adde565fe77b0d1a44b3ca51d540f314fea6a7a38d93"
+          ],
+          [
+            135385,
+            34754,
+            "bd35a8177d301af3101ba8dc05f33eb97bf3dc788f847992a444dae5b19d9735"
+          ],
+          [
+            170139,
+            150718,
+            "0ad222d1ed9bc4feacca92c6a160ccce127d7bdf16385cc35c95ffe4cc5cb643"
+          ],
+          [
+            320857,
+            31916,
+            "6bdfbf82e0bf556b961dade699701df2523607ac994d770efbdc46ee0509e916"
+          ],
+          [
+            352773,
+            31887,
+            "070cdb7a824582655ca8121dac815fc6d9f33cd9d2526eb5b06cdc20eda88324"
+          ],
+          [
+            384660,
+            131306,
+            "4320fc7663c4f377caaf90fd8b7ad9f3054d84cbeab17012b6dce2d5989fa05f"
+          ],
+          [
+            515966,
+            39070,
+            "114d93fb133e1215e502e7d6febf5dc1548605e8bd048b1608add822cc7207fe"
+          ],
+          [
+            555036,
+            53900,
+            "e86de1e004796a3124f3f621563241592d7c0c71910a498f23ea48158647613c"
+          ],
+          [
+            608936,
+            47008,
+            "7ae99a516f8262b0316a5cec558d23c92612ce465996fb47e25cafa392988994"
+          ],
+          [
+            655944,
+            18855,
+            "8f4846e82fcfbf7397fed3c04cb7e76fe0d26f989d8ce52d0113fb0df54a1c0c"
+          ],
+          [
+            674799,
+            65647,
+            "36e58f303ac3f364684b41f3956eea18953aa422cd5ca225323e724317377e61"
+          ],
+          [
+            740446,
+            55220,
+            "6bcd49192d69141f8de370abd6ea101456716e73976c182b95f314920a1bc48e"
+          ],
+          [
+            795666,
+            75611,
+            "d3449470f3b4889b1d408e8219f32b90e692c0280697788cc8bdd3d04fcbdea7"
+          ],
+          [
+            871277,
+            75317,
+            "3a53775d35bde9caa4ca2af81bcc375b451b55ed3d4348447cb6f8f7308c7ffc"
+          ],
+          [
+            946594,
+            71282,
+            "3ccb152cf7d6a2f82318ffb6743253dcd669d70983bf355b010dba6ecbcadce3"
+          ],
+          [
+            1017876,
+            30700,
+            "12b5a0eb119abca7722213e6bcf7630e5e9faaf1f537be884bf61eb4997ba162"
+          ]
+        ]
+      }
+    }
+  ]
+}
