@@ -1,4 +1,4 @@
-import assert from 'node:assert/strict';import {indexedDB} from 'fake-indexeddb';import {MirroredFiles} from '../active-system/storage/browser/mirror.mjs';
+import assert from 'node:assert/strict';import {indexedDB} from 'fake-indexeddb';import {MirroredFiles} from '../../active-system/storage/browser/mirror.mjs';
 const originalTimeout=globalThis.setTimeout,originalDoc=globalThis.document,originalDB=globalThis.indexedDB,originalNow=Date.now;const delays=[];let now=100000,fail=false,lists=0;const doc=new EventTarget();doc.visibilityState='visible';globalThis.document=doc;globalThis.indexedDB=indexedDB;Date.now=()=>now;globalThis.setTimeout=(fn,delay,...args)=>{if(delay>=1000)delays.push(delay);return originalTimeout(fn,delay,...args)};
 const server={async list(){lists++;if(fail)throw Object.assign(Error('offline'),{status:503});return {entries:[]}}};const mirror=new MirroredFiles({scope:'idle-scheduling',server,retryMs:15000});
 try{

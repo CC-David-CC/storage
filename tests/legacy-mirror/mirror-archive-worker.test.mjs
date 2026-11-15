@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {indexedDB,IDBKeyRange} from 'fake-indexeddb';
-import {MirroredFiles} from '../active-system/storage/browser/mirror.mjs';
+import {MirroredFiles} from '../../active-system/storage/browser/mirror.mjs';
 globalThis.indexedDB=indexedDB;globalThis.IDBKeyRange=IDBKeyRange;
 const digest=async blob=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',await blob.arrayBuffer()))].map(x=>x.toString(16).padStart(2,'0')).join('');
 let captures=0,fail=false;

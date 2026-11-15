@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {indexedDB,IDBKeyRange} from 'fake-indexeddb';
-import {MirroredFiles,MirrorConflict,filePath} from '../active-system/storage/browser/mirror.mjs';
+import {MirroredFiles,MirrorConflict,filePath} from '../../active-system/storage/browser/mirror.mjs';
 globalThis.indexedDB=indexedDB;globalThis.IDBKeyRange=IDBKeyRange;
 const sha=async data=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',data))].map(b=>b.toString(16).padStart(2,'0')).join('');
 class Server{

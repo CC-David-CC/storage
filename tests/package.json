@@ -1,0 +1,9 @@
+{
+  "name": "@webos/storage-mirror-reference-tests",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "fake-indexeddb": "6.2.8"
+  }
+}

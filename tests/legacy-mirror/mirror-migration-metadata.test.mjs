@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {indexedDB,IDBKeyRange} from 'fake-indexeddb';
-import {MirroredFiles} from '../active-system/storage/browser/mirror.mjs';
+import {MirroredFiles} from '../../active-system/storage/browser/mirror.mjs';
 globalThis.indexedDB=indexedDB;globalThis.IDBKeyRange=IDBKeyRange;
 Object.defineProperty(globalThis,'navigator',{value:{locks:{request:async(_name,_options,fn)=>fn()}},configurable:true});
 const server={async list(){throw Error('offline')}},scope='metadata-migration',legacy=new MirroredFiles({scope,server,retryMs:0});

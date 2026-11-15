@@ -10,6 +10,7 @@
     "@webos/accounts": "0.1.0"
   },
   "scripts": {
-    "test:owned-reference": "node --test --test-reporter=tap tests/legacy-owned/incremental-sha-vectors.test.mjs tests/legacy-owned/file-capture-worker.test.mjs tests/legacy-owned/chunk-sync-browser-vectors.test.mjs tests/legacy-owned/file-delta-collision-test.mjs tests/legacy-owned/upload-worker-delta-vectors.test.mjs"
+    "test:owned-reference": "node --test --test-reporter=tap tests/legacy-owned/incremental-sha-vectors.test.mjs tests/legacy-owned/file-capture-worker.test.mjs tests/legacy-owned/chunk-sync-browser-vectors.test.mjs tests/legacy-owned/file-delta-collision-test.mjs tests/legacy-owned/upload-worker-delta-vectors.test.mjs",
+    "test:legacy-mirror-reference": "node --test --test-reporter=tap --test-timeout=60000 tests/legacy-mirror/mirror-archive-worker.test.mjs tests/legacy-mirror/mirror-bounded-read.test.mjs tests/legacy-mirror/mirror-commit-uncertainty.test.mjs tests/legacy-mirror/mirror-idle-scheduling.test.mjs tests/legacy-mirror/mirror-migration-metadata.test.mjs tests/legacy-mirror/mirror-verified-content.test.mjs tests/legacy-mirror/mirrored-files.test.mjs"
   }
 }

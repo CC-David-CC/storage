@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {indexedDB,IDBObjectStore} from 'fake-indexeddb';
-import {MirroredFiles,MirrorCommitUncertain} from '../active-system/storage/browser/mirror.mjs';
+import {MirroredFiles,MirrorCommitUncertain} from '../../active-system/storage/browser/mirror.mjs';
 globalThis.indexedDB=indexedDB;
 let valid=true;const originalPut=IDBObjectStore.prototype.put;
 const server={list:async()=>{throw Error('offline')}};
