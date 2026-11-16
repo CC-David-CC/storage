@@ -91,7 +91,7 @@ class FileGateway:
         if type(max_waiters) is not int or not 1<=max_waiters<=256 or not isinstance(queue_seconds,(int,float)) or isinstance(queue_seconds,bool) or not 0<queue_seconds<=10:raise ValueError('Bounded request queue required')
         self.max_requests_per_minute=max_requests_per_minute
         self.seconds=seconds_per_use;self.idle=idle_seconds;self.upload_idle=upload_idle_seconds;self.active=0
-        self.slots=asyncio.Semaphore(4);self.waiting=0;self.max_waiters=max_waiters;self.queue_seconds=queue_seconds
+        self.slots=asyncio.Semaphore(self.quotas.shared_concurrent);self.waiting=0;self.max_waiters=max_waiters;self.queue_seconds=queue_seconds
         self.window=0;self.requests=0
         self.client_source=Path(__file__).with_name('client.mjs').read_bytes()
         source=Path(__file__).parent/'vendor/js-sha256';self.sha_modules={name:(source/name).read_bytes() for name in ('core.mjs','shared.mjs','verify-worker.mjs')}

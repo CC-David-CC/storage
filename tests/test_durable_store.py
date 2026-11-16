@@ -6,6 +6,7 @@ import unittest
 import uuid
 
 from webos_storage import Conflict, DEFAULT_ACCOUNT_FOLDERS, Denied, Principal, UserStore
+from webos_storage.transfers import Quotas, AllowanceExceeded, initialize_transfers
 
 
 class DurableStoreTests(unittest.TestCase):
@@ -54,6 +55,25 @@ class DurableStoreTests(unittest.TestCase):
         anonymous = Principal(str(uuid.uuid4()), str(uuid.uuid4()), 'anonymous', {}, int(time.time()) + 3600)
         with self.assertRaises(Denied):
             self.store.ensure_user(anonymous)
+
+    def test_eight_account_transfers_and_sixteen_shared_preserve_backpressure(self):
+        initialize_transfers(self.store)
+        quotas = Quotas(self.store, concurrent_uses=8, shared_concurrent_uses=16)
+        other = Principal('user:' + str(uuid.uuid4()), str(uuid.uuid4()), 'registered', {}, int(time.time()) + 3600)
+        third = Principal('user:' + str(uuid.uuid4()), str(uuid.uuid4()), 'registered', {}, int(time.time()) + 3600)
+        active = []
+        try:
+            active.extend(quotas.begin(self.owner, 512) for _ in range(8))
+            with self.assertRaises(AllowanceExceeded):
+                quotas.begin(self.owner, 512)
+            active.extend(quotas.begin(other, 512) for _ in range(8))
+            with self.assertRaises(AllowanceExceeded):
+                quotas.begin(third, 512)
+            quotas.finish(active.pop(0))
+            active.append(quotas.begin(third, 512))
+        finally:
+            for transfer in active:
+                quotas.finish(transfer)
 
 
 if __name__ == '__main__':

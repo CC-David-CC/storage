@@ -49,6 +49,10 @@ async function runFileWorker(workerUrl,operation,blob,check=()=>{},signal=null,e
   })}finally{worker.terminate()}
 }
 export class UserFiles{
+  #activeRequests=0;
+  #requestWaiters=[];
+  #queuedRequests=0;
+  #queuedBytes=0;
   constructor(authority,{workerUrl=new URL('./vendor/js-sha256/verify-worker.mjs',import.meta.url)}={}){
     requireThat(authority&&typeof authority.check==='function'&&typeof authority.authorize==='function','Authoritative account-files capability required');
     const url=new URL(workerUrl,location.href);requireThat(url.origin===location.origin,'Same-origin verification worker required');
@@ -93,6 +97,20 @@ export class UserFiles{
   async request(operation,fields={},binary=null,binaryResponse=false){
     this.check();
     const raw=JSON.stringify({resource:'my-files',operation,...fields});requireThat(new TextEncoder().encode(raw).length<=MAX_RESPONSE,'File request too large');
+    // Restored app windows share this account service. Keep four transfers in
+    // flight, leaving room for another client under the account's eight slots.
+    // Capture mutable input before waiting, and never replay a dispatched write.
+    if(binary!==null)requireThat((binary instanceof Uint8Array&&binary.length<=MAX_FILE)||(binary instanceof Blob&&binary.size<=MAX_FILE),'Invalid binary upload');
+    const size=raw.length*2+(binary?.size??binary?.length??0);
+    if(this.#queuedRequests>=16||this.#queuedBytes+size>2*MAX_RESPONSE)throw new FileRequestError('Too many pending account-file operations; wait for the current operations to finish',429);
+    const snapshot=binary instanceof Uint8Array?new Blob([binary]):binary;
+    this.#queuedRequests++;this.#queuedBytes+=size;
+    if(this.#activeRequests<4)this.#activeRequests++;
+    else await new Promise(resolve=>this.#requestWaiters.push(resolve));
+    try{this.check();return await this.#requestCaptured(operation,raw,snapshot,!!binaryResponse);}
+    finally{this.#queuedRequests--;this.#queuedBytes-=size;const next=this.#requestWaiters.shift();if(next)next();else this.#activeRequests--;}
+  }
+  async #requestCaptured(operation,raw,binary,binaryResponse){
     const requestSha=await hash(raw);
     const challenge=await this.post(this.base+'/challenge',JSON.stringify({key:this.authority.publicKey,request_sha256:requestSha}));
     requireThat(typeof challenge.nonce==='string'&&/^[A-Za-z0-9_-]{43}$/.test(challenge.nonce)&&challenge.request_sha256===requestSha,'Invalid gateway challenge');

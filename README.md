@@ -1,5 +1,7 @@
 # Storage
 
+The shared browser file client now admits four requests at once, with a bounded queue and byte budget. Queued work captures its inputs before waiting, rechecks account authority on admission and never replays a dispatched mutation. This prevents window restoration from flooding the gateway. The test composition selects eight concurrent transfers/account and sixteen shared; FileGateway derives its global admission capacity from the supplied quotas. Library defaults, file-size/storage/daily limits and pacing remain unchanged.
+
 Owns account file persistence, revision preconditions, permissions, bounded transfers, and the browser mirror implementation. The Python public API is `webos_storage.UserStore`, `FileGateway`, `Gatekeeper`, `Principal`, `Conflict`, `CommitUncertain`, and explicit ledger/transfer initialization. Stateless identity proof primitives come from the public Accounts package; no old-workspace or private cross-repository import is used by the packaged server.
 
 Install alongside the trusted local Accounts checkout using the parent development environment; do not substitute an unrelated public package with the same name. The parent pins both repositories. Third-party dependencies are locked separately by composition.
