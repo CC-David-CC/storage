@@ -3,7 +3,13 @@ import {hash, requireThat} from '@webos/accounts/crypto';
 
 const MAX_FILE=128*1024*1024,MAX_RESPONSE=192*1024*1024;
 export class FileRequestError extends Error{
-  constructor(message,status){super(message);this.name='FileRequestError';this.status=status;}
+  constructor(message,status,retryAfter=null){
+    super(message);this.name='FileRequestError';this.status=status;
+    if(!retryAfter)return;
+    const delay=/^[0-9]+$/.test(retryAfter) ? Number(retryAfter)*1000
+      : /^[A-Za-z]{3}/.test(retryAfter) ? Date.parse(retryAfter)-Date.now() : NaN;
+    if(Number.isSafeInteger(delay)&&delay>=0)this.retryAfterMs=delay;
+  }
 }
 // Keep temporary binary strings small; a 128 MiB file must not create a
 // second 128 MiB JavaScript string merely to call atob/btoa.
@@ -78,14 +84,14 @@ export class UserFiles{
     const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length;}
     this.check();
     let value;try{value=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));}catch{
-      if(!response.ok)throw new FileRequestError('File service request failed ('+response.status+')',response.status);
+      if(!response.ok)throw new FileRequestError('File service request failed ('+response.status+')',response.status,response.headers.get('Retry-After'));
       throw Error('Invalid file service response');
     }
-    if(!response.ok)throw new FileRequestError(value?.error||'File request failed',response.status);return value;
+    if(!response.ok)throw new FileRequestError(value?.error||'File request failed',response.status,response.headers.get('Retry-After'));return value;
   }
   async postBinary(path,body,headers){
     this.check();const response=await fetch(path,{method:'POST',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:'no-referrer',headers:{'Content-Type':'application/json',...headers},body,signal:AbortSignal.timeout(910000)});
-    if(!response.ok){let value;try{value=await response.json()}catch{value={}}throw new FileRequestError(value.error||'File request failed',response.status);}
+    if(!response.ok){let value;try{value=await response.json()}catch{value={}}throw new FileRequestError(value.error||'File request failed',response.status,response.headers.get('Retry-After'));}
     const lengthText=response.headers.get('Content-Length'),sha256=response.headers.get('X-Codi-File-SHA256');
     requireThat(response.headers.get('Content-Type')==='application/octet-stream'&&typeof lengthText==='string'&&/^(0|[1-9][0-9]*)$/.test(lengthText)&&typeof sha256==='string'&&/^[0-9a-f]{64}$/.test(sha256),'Invalid binary file response');
     const size=Number(lengthText);requireThat(Number.isSafeInteger(size)&&size<=MAX_FILE,'Invalid binary file size');

@@ -33,3 +33,21 @@ test('a session change prevents queued work from obtaining a new grant or dispat
   await Promise.all([...tasks,queued].map(p=>assert.rejects(p,{name:'AbortError'})));assert.equal(uses,4);assert.equal(grants,4);
  }finally{globalThis.fetch=before;gate.resolve();}
 });
+
+test('HTTP save errors retain the advertised Retry-After delay',async()=>{
+ const before=globalThis.fetch;
+ const client=new UserFiles(authority(()=>{}),{workerUrl:'/verify-worker.mjs'});
+ try{
+  globalThis.fetch=async()=>Response.json({error:'Transfer allowance reached; try later'},
+    {status:429,headers:{'Retry-After':'75'}});
+  await assert.rejects(client.post('/gateway/upload','{}'),{name:'FileRequestError',status:429,retryAfterMs:75_000});
+  const future=new Date(Date.now()+120_000).toUTCString();
+  globalThis.fetch=async()=>Response.json({error:'Transfer allowance reached; try later'},
+    {status:429,headers:{'Retry-After':future}});
+  await assert.rejects(client.post('/gateway/upload','{}'),error=>
+    error.status===429&&error.retryAfterMs>=118_000&&error.retryAfterMs<=120_000);
+  globalThis.fetch=async()=>Response.json({error:'Transfer allowance reached; try later'},
+    {status:429,headers:{'Retry-After':'5, 60'}});
+  await assert.rejects(client.post('/gateway/upload','{}'),error=>error.status===429&&error.retryAfterMs===undefined);
+ }finally{globalThis.fetch=before;}
+});
