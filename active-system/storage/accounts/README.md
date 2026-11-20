@@ -9,7 +9,7 @@ its files are stored at:
 
 My files presents that account folder as `/`; it is not the server's system
 root or the temporary Linux guest filesystem. New accounts receive Documents,
-Digital Projects, 3D Objects, Games, Pictures, Audio and Video as ordinary
+Digital-Projects, 3D-Objects, Games, Pictures, Audio and Video as ordinary
 private folders. Users may rename or delete them; they are seeded only while a
 new account's home is initialized and are not recreated on later sign-ins.
 

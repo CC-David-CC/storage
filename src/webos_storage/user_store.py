@@ -25,7 +25,7 @@ from functools import wraps
 from .policy import Denied, Principal, integer, parts
 
 OPERATIONS = ('list', 'read', 'create', 'replace', 'mkdir', 'delete', 'rename')
-DEFAULT_ACCOUNT_FOLDERS = ('Documents', 'Digital Projects', '3D Objects', 'Games', 'Pictures', 'Audio', 'Video')
+DEFAULT_ACCOUNT_FOLDERS = ('Documents', 'Digital-Projects', '3D-Objects', 'Games', 'Pictures', 'Audio', 'Video')
 class Conflict(Denied):
     """The caller's file version or create precondition no longer holds."""
 class CommitUncertain(OSError):

@@ -26,6 +26,13 @@ class DurableStoreTests(unittest.TestCase):
     def open_store(self):
         return UserStore(self.state, self.data, initial_folders=DEFAULT_ACCOUNT_FOLDERS)
 
+    def test_account_starter_folders_are_shell_friendly(self):
+        root = self.data / 'users' / uuid.UUID(self.owner.sub[5:]).hex
+        self.assertEqual(
+            {path.name for path in root.iterdir()},
+            {'Documents', 'Digital-Projects', '3D-Objects', 'Games', 'Pictures', 'Audio', 'Video'},
+        )
+
     def test_saved_bytes_revision_and_ownership_survive_service_restart(self):
         saved = self.store.put(self.owner, 'Documents/restart.txt', b'Durable synthetic document')
         resumed = self.open_store()
