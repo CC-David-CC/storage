@@ -67,6 +67,7 @@ export class MirroredFiles{
   #changed(){for(const fn of this.#listeners)try{fn();}catch(e){console.error('File view update failed',e);}}
   #watchValidity(){const timer=setInterval(()=>{try{this.#check()}catch{this.#captureAbort.abort();this.#content?.close?.();clearInterval(timer)}},100);return ()=>clearInterval(timer);}
   subscribe(fn){this.#check();need(typeof fn==='function','Listener required.');this.#listeners.add(fn);return ()=>this.#listeners.delete(fn);}
+  async ready(){ await this.#open(); }
   async #open(){
     this.#check();if(this.#db)return this.#db;
     this.#opening??=new Promise((resolve,reject)=>{

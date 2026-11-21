@@ -22,3 +22,27 @@ export function createAccountFileMirror({issuer,owner,server,valid,storage=null}
   try{return new MirroredFiles({scope,server,valid,content});}
   catch(error){content?.close();throw error;}
 }
+
+
+// A release without an explicit migration still needs to read clients that
+// already use OPFS. Probe the version floor without writing any account rows.
+export async function openAccountFileMirror(options) {
+  async function open(storage) {
+    const mirror = createAccountFileMirror({...options, storage});
+    try {
+      await mirror.ready();
+      return mirror;
+    } catch (error) {
+      mirror.close();
+      throw error;
+    }
+  }
+  try {
+    return await open(options.storage);
+  } catch (error) {
+    if (options.storage != null || error.name !== 'VersionError') throw error;
+    // IndexedDB rejects version 1 before starting a transaction on a v2 store.
+    // The explicit v2 open also rejects databases from a newer release.
+    return open({version:'codi-browser-file-content/1', backend:'opfs', databaseVersion:2});
+  }
+}

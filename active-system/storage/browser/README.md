@@ -61,7 +61,7 @@ For an isolated connected preview this is `--user-files --file-content-store
 opfs`. This is an **origin-wide release selection**, not an app or account
 preference. OPFS content references raise the shared mirror database to version
 2. Older version-1 writers stop on version change and cannot reopen the database.
-Removing the config does not undo this migration or make an old client usable.
+Removing the config does not undo this migration. The desktop uses `openAccountFileMirror` to resume version 2 with its verified OPFS reader and writer. Fresh and version-1 profiles keep the configured default. Future database versions are refused.
 Unknown storage versions and unavailable OPFS fail explicitly; there is no silent
 fallback to an older writer. Qualify the guarded assets and recovery procedure
 before enabling this on beta or promoting it to main.
