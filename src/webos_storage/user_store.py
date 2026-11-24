@@ -61,6 +61,10 @@ SCHEMA = [
     "CREATE TABLE users (subject TEXT PRIMARY KEY, home_id TEXT UNIQUE NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','ready')), enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), created INTEGER NOT NULL)",
     'CREATE TABLE permissions (subject TEXT NOT NULL REFERENCES users(subject), resource TEXT NOT NULL, operation TEXT NOT NULL, allowed INTEGER NOT NULL CHECK(allowed IN (0,1)), PRIMARY KEY(subject,resource,operation))',
 ]
+RETIRED_HOMES_SCHEMA = (
+    'CREATE TABLE IF NOT EXISTS retired_homes ('
+    'subject TEXT PRIMARY KEY NOT NULL REFERENCES users(subject)) WITHOUT ROWID'
+)
 
 def registered(principal):
     if not isinstance(principal, Principal) or principal.kind != 'registered' or not isinstance(principal.sub, str) or not principal.sub.startswith('user:'):
@@ -84,6 +88,40 @@ def private_directory(path):
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
         raise ValueError('Storage directory must be owned and private (0700)')
     return path
+
+
+def private_file(path):
+    info = Path(path).lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1:
+        raise ValueError('Owned private regular storage file required')
+
+
+@contextmanager
+def storage_lock(path, *, create=False):
+    access = (os.O_RDWR | os.O_CREAT) if create else os.O_RDONLY
+    flags = access | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open(path, flags, 0o600)
+    try:
+        private_file(path)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def permissions_database(path, *, read_only=False):
+    private_file(path)
+    db = sqlite3.connect(
+        path.as_uri() + ('?mode=ro' if read_only else '?mode=rw'),
+        uri=True, timeout=2, isolation_level=None,
+    )
+    try:
+        db.execute('PRAGMA foreign_keys=ON')
+        yield db
+    finally:
+        db.close()
+
 
 class UserStore:
     def __init__(self, state_root, data_root, *, clock=time.time,
@@ -129,6 +167,7 @@ class UserStore:
             with self.db() as db:
                 if db.execute('SELECT version FROM metadata').fetchall() != [(1,)] or db.execute('PRAGMA integrity_check').fetchall() != [('ok',)] or db.execute('PRAGMA foreign_key_check').fetchall():
                     raise ValueError('Permission database unavailable; retain it for recovery')
+                db.execute(RETIRED_HOMES_SCHEMA)
             if not self.users_path.exists():
                 if not new:
                     raise ValueError('Retained user storage missing; retain state for recovery')
@@ -168,31 +207,13 @@ class UserStore:
             error = ctypes.get_errno()
             raise OSError(error, os.strerror(error))
 
-    @staticmethod
-    def _private_file(path):
-        info = Path(path).lstat()
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1:
-            raise ValueError('Owned private regular storage file required')
+    _private_file = staticmethod(private_file)
 
-    @contextmanager
     def lock(self):
-        fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-        try:
-            self._private_file(self.lock_path)
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
-        finally:
-            os.close(fd)
+        return storage_lock(self.lock_path, create=True)
 
-    @contextmanager
     def db(self):
-        self._private_file(self.database)
-        db = sqlite3.connect('file:' + quote(str(self.database), safe='/') + '?mode=rw', uri=True, timeout=2, isolation_level=None)
-        db.execute('PRAGMA foreign_keys=ON')
-        try:
-            yield db
-        finally:
-            db.close()
+        return permissions_database(self.database)
 
     def _home(self, home_id):
         if len(home_id) != 32 or any(c not in '0123456789abcdef' for c in home_id):
@@ -206,7 +227,10 @@ class UserStore:
             if row and row[0] != home_id:
                 raise ValueError('Account/folder binding changed; retain state for review')
             if row is None:
-                if db.execute('SELECT count(*) FROM users').fetchone()[0] >= self.maximum_users:
+                active = db.execute(
+                    'SELECT count(*) FROM users WHERE subject NOT IN (SELECT subject FROM retired_homes)'
+                ).fetchone()[0]
+                if active >= self.maximum_users:
                     raise Denied('Registered storage account capacity exceeded')
                 db.execute('BEGIN IMMEDIATE')
                 db.execute("INSERT INTO users VALUES(?,?,'pending',1,?)", (principal.sub, home_id, int(self.clock())))
@@ -929,7 +953,11 @@ class UserStore:
         if type(enabled) is not bool:
             raise ValueError('Boolean storage policy required')
         with self.lock(), self.db() as db:
-            cursor = db.execute('UPDATE users SET enabled=? WHERE subject=? AND state=?', (int(enabled), subject, 'ready'))
+            cursor = db.execute(
+                'UPDATE users SET enabled=? WHERE subject=? AND state=? '
+                'AND subject NOT IN (SELECT subject FROM retired_homes)',
+                (int(enabled), subject, 'ready'),
+            )
             if cursor.rowcount != 1:
                 raise ValueError('Unknown ready registered storage account')
 
