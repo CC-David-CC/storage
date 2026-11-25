@@ -1,3 +1,4 @@
+import {sha256} from './opfs/core.mjs';
 import {isContentRef} from './verified-content.mjs';
 /** Account-scoped local-first file mirror. The server client performs signed,
  * authorized operations; this module never sends a file to another origin. */
@@ -34,6 +35,22 @@ function serializeLocal(key,operation,signal){
 // records contain ArrayBuffers; retain read/sync compatibility with them.
 const storedSize=value=>isContentRef(value)?value.size:value instanceof Blob?value.size:value.byteLength;
 async function digest(value){return [...new Uint8Array(await crypto.subtle.digest('SHA-256',value))].map(b=>b.toString(16).padStart(2,'0')).join('');}
+// Verify disconnected Blob captures in small chunks using the retained hash
+// implementation. Re-read OS-backed files before publishing their snapshot.
+async function hashBlobOnDevice(blob,check,parts=null){
+  const hash=sha256.create();
+  const step=256*1024;
+  for(let offset=0;offset<blob.size;offset+=step){
+    const length=Math.min(step,blob.size-offset);
+    const chunk=await blob.slice(offset,offset+length).arrayBuffer();
+    check();
+    need(chunk.byteLength===length,'Source changed during capture.');
+    hash.update(chunk);
+    parts?.push(new Blob([chunk]));
+  }
+  check();
+  return hash.hex();
+}
 // The browser's Blob.arrayBuffer cannot be cancelled; stop waiting and
 // discard its eventual result when a caller aborts.
 function abortable(task,signal){
@@ -354,12 +371,22 @@ export class MirroredFiles{
     let stored,sha256;
     if(this.#content){
       const ref=await this.#content.capture(incoming||new Blob([copy]));this.#check();need(isContentRef(ref)&&ref.size===size,'Invalid file capture.');stored=ref;sha256=ref.sha256;
+    }else if(copy){
+      // These bytes already belong to the mirror. Native hashing needs no
+      // worker download or additional source read.
+      sha256=await digest(copy);this.#check();
+      stored=new Blob([copy]);
+    }else if(globalThis.navigator?.onLine===false){
+      const parts=[],check=()=>this.#check();
+      sha256=await hashBlobOnDevice(incoming,check,parts);
+      need(await hashBlobOnDevice(incoming,check)===sha256,'Source changed during capture.');
+      stored=new Blob(parts);
     }else if(typeof this.#server.captureSnapshot==='function'){
-      const source=incoming||new Blob([copy]);const result=await this.#server.captureSnapshot(source,{signal:this.#captureAbort.signal});this.#check();
+      const result=await this.#server.captureSnapshot(incoming,{signal:this.#captureAbort.signal});this.#check();
       need(result?.blob instanceof Blob&&result.blob.size===size&&typeof result.sha256==='string'&&/^[0-9a-f]{64}$/.test(result.sha256),'Invalid file capture.');stored=result.blob;sha256=result.sha256;
     }else{
       // Older server adapters retain their original capture behavior.
-      const snapshot=incoming?await incoming.arrayBuffer():copy;sha256=await digest(snapshot);stored=new Blob([snapshot]);this.#check();
+      const snapshot=await incoming.arrayBuffer();sha256=await digest(snapshot);stored=new Blob([snapshot]);this.#check();
     }
     const result=await this.#storeContent([stored],([record])=>this.#mutate(path,(old,all)=>{if(parent(path)!=='/'){const p=all.find(r=>r.path===parent(path));need(p&&!p.deleted&&p.directory,'Create the parent folder first.');}need(all.length<MAX_ENTRIES||old,'Browser file limit reached.');if(old?.moving)throw Error('Wait for this move to finish syncing.');if(old?.conflict)throw new MirrorConflict('Resolve the file conflict in Files before saving.');if(expected===null?!!old:!old||old.deleted||old.directory||old.version!==expected)throw new MirrorConflict('This file changed; reload it before saving.');
       const row={scope:this.#scope,path,directory:false,data:record,sha256,base:old?.base??null,attempted:old?.attempted??null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:!!old?.conflict};return [row,{path,version:row.version,sha256,status:row.conflict?'conflict':'pending'}];},accountParents));

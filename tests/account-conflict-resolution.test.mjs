@@ -48,7 +48,7 @@ function setup(t) {
   };
   const mirror = new MirroredFiles({scope:crypto.randomUUID(),server,retryMs:0});
   t.after(() => mirror.close());
-  return {entries, mirror, setOffline:value => {offline=value;}, mutations:() => mutations};
+  return {entries, mirror, server, setOffline:value => {offline=value;}, mutations:() => mutations};
 }
 
 async function waitUntilOffline(mirror) {
@@ -279,4 +279,39 @@ test('a nested folder can be created inside a new account folder and absent or d
   await waitUntilOffline(mirror);
   await assert.rejects(mirror.write('/Deleting/draft.txt',bytes('not written')),/Create the parent folder first/);
   assert.equal((await mirror.list('/')).entries.some(item=>item.name==='Deleting'),false);
+});
+
+test('cached account folders accept verified draft data without loading a worker',async t=>{
+  const {entries,mirror,server,setOffline}=setup(t);
+  entries.set('Project',{directory:true});
+  await mirror.sync();
+  const prior=Object.getOwnPropertyDescriptor(navigator,'onLine');
+  Object.defineProperty(navigator,'onLine',{configurable:true,value:false});
+  t.after(()=>{
+    if(prior)Object.defineProperty(navigator,'onLine',prior);
+    else delete navigator.onLine;
+  });
+  let workerCalls=0;
+  server.captureSnapshot=()=>{
+    workerCalls++;
+    throw Error('File verification worker failed');
+  };
+  setOffline(true);
+  const bytesPath='/Project/offline.txt';
+  const bytesResult=await mirror.write(bytesPath,bytes('retained draft'));
+  assert.equal(bytesResult.sha256,entry('retained draft').sha256);
+  assert.equal(new TextDecoder().decode((await mirror.read(bytesPath)).data),'retained draft');
+
+  const bundle='Ω'.repeat(131073);
+  const blobPath='/Project/archive.txt';
+  const blobResult=await mirror.write(blobPath,new Blob([bundle]));
+  assert.equal(blobResult.sha256,entry(bundle).sha256);
+  assert.equal(new TextDecoder().decode((await mirror.read(blobPath)).data),bundle);
+  assert.equal(workerCalls,0);
+
+  const changing=new Blob(['prior']);
+  let reads=0;
+  changing.slice=()=>new Blob([++reads===1?'prior':'later']);
+  await assert.rejects(mirror.write('/Project/changing.txt',changing),/changed during capture/);
+  await assert.rejects(mirror.read('/Project/changing.txt'),/not found/);
 });
