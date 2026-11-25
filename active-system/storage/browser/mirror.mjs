@@ -613,14 +613,47 @@ export class MirroredFiles{
     });
     this.#running=task;return task;
   }
-  async resolve(path,choice,expected,internal=null){if(this.#content&&internal!==PUBLICATION_LOCKED)return this.#withPublicationLock(()=>this.resolve(path,choice,expected,PUBLICATION_LOCKED));this.#check();const stopValidity=this.#watchValidity();try{path=filePath(path);need(['local','server'].includes(choice),'Choose which copy to keep.');const row=await this.#get(path);if(!row||!row.conflict||row.version!==expected)throw new MirrorConflict('This item changed; reload before resolving.');need(!row.directory,'Folder conflicts require manual resolution.');
-    const inventory=await this.#remoteInventory(),entry=inventory.get(path);need(!entry?.directory,'The server has a folder at this path.');const remote=entry?await this.#server.read(path.slice(1),{signal:this.#captureAbort.signal}):null;this.#check();
-    if(choice==='local'){await this.#update(path,current=>{if(!current||current.version!==expected)throw new MirrorConflict();return [{...current,base:remote?.sha256??null,attempted:null,conflict:false,dirty:true},true];});}
-    else{let stored=remote?new Blob([remote.data]):null;
-      if(remote&&this.#content){const ref=await this.#content.capture(stored);this.#check();need(isContentRef(ref)&&ref.size===stored.size&&ref.sha256===remote.sha256,'Remote file failed verification.');stored=ref;}
-      await this.#storeContent([stored],([data])=>this.#update(path,current=>{if(!current||current.version!==expected)throw new MirrorConflict();if(!remote)return [null,true];return [{scope:this.#scope,path,directory:false,data,sha256:remote.sha256,base:remote.sha256,version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false},true];}));}
-    this.#changed();if(choice==='local'){this.#hasPending=true;this.#queueSync();}
-    }finally{stopValidity()}
+  async resolve(path,choice,expected,internal=null){
+    if(this.#content&&internal!==PUBLICATION_LOCKED)return this.#withPublicationLock(()=>this.resolve(path,choice,expected,PUBLICATION_LOCKED));
+    this.#check();
+    const stopValidity=this.#watchValidity();
+    try{
+      path=filePath(path);
+      need(['local','server'].includes(choice),'Choose which copy to keep.');
+      const checkSelection=row=>{
+        if(!row?.conflict||row.version!==expected||row.moving)throw new MirrorConflict('This item changed; refresh before resolving.');
+        need(!row.directory,'Folder conflicts require manual resolution.');
+      };
+      checkSelection(await this.#get(path));
+      const entry=(await this.#remoteInventory()).get(path);
+      if(choice==='local')need(!entry?.directory,'The server has a folder at this path.');
+      const remote=entry&&!entry.directory?await this.#server.read(path.slice(1),{signal:this.#captureAbort.signal}):null;
+      this.#check();
+      if(choice==='local'){
+        await this.#update(path,current=>{
+          checkSelection(current);
+          return [{...current,base:remote?.sha256??null,attempted:null,conflict:false,dirty:true},true];
+        });
+        this.#hasPending=true;
+      }else{
+        let stored=remote?new Blob([remote.data]):null;
+        if(remote&&this.#content){
+          const ref=await this.#content.capture(stored);
+          this.#check();
+          need(isContentRef(ref)&&ref.size===stored.size&&ref.sha256===remote.sha256,'Remote file failed verification.');
+          stored=ref;
+        }
+        await this.#update(path,current=>{
+          checkSelection(current);
+          if(!entry)return [null,true];
+          const directory=entry.directory;
+          return [{scope:this.#scope,path,directory,data:stored,sha256:remote?.sha256??null,
+            base:directory?'dir':remote.sha256,version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false},true];
+        });
+      }
+      this.#changed();
+      if(choice==='local'||entry?.directory)this.#queueSync();
+    }finally{stopValidity();}
   }
   async persistence(){return {supported:typeof navigator.storage?.persist==='function'&&typeof navigator.storage?.persisted==='function',persistent:typeof navigator.storage?.persisted==='function'&&await navigator.storage.persisted()===true};}
   async requestPersistence(){need(navigator.userActivation?.isActive,'Use the storage protection button.');need(typeof navigator.storage?.persist==='function','Storage protection is unavailable.');await navigator.storage.persist();return this.persistence();}
