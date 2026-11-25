@@ -242,7 +242,9 @@ test('saving to a new account-only folder confirms the parent and preserves the 
     return put.call(this,value,...args);
   };
   t.after(()=>{IDBObjectStore.prototype.put=put;});
-  const original=bytes('captured before lookup');
+  // Keep this above the inline limit to exercise the Blob retry after rollback.
+  const originalText='captured before lookup'.repeat(3100);
+  const original=bytes(originalText);
   const saving=mirror.write('/Project/Nested/draft.txt',original);
   original.fill(0);
   const saved=await saving;
@@ -253,7 +255,7 @@ test('saving to a new account-only folder confirms the parent and preserves the 
     ['/Project',undefined],
     ['/Project/Nested',undefined]
   ]);
-  assert.equal(new TextDecoder().decode((await mirror.read('/Project/Nested/draft.txt')).data),'captured before lookup');
+  assert.equal(new TextDecoder().decode((await mirror.read('/Project/Nested/draft.txt')).data),originalText);
   assert.equal((await mirror.list('/Project')).entries[0].status,'synced');
   setOffline(true);
   assert.equal((await mirror.write('/Project/Nested/offline.txt',bytes('can save offline'))).status,'pending');

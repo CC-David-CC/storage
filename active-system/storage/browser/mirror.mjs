@@ -63,6 +63,11 @@ function abortable(task,signal){
 }
 export class MirrorConflict extends Error{constructor(message='This file changed on another device. Choose which copy to keep.'){super(message);this.name='MirrorConflict';}}
 export class MirrorCommitUncertain extends Error{constructor(){super('Account changed after a local storage transaction committed. Reopen the original account and check the file before retrying.');this.name='MirrorCommitUncertain';}}
+class UnreadableMirrorBlob extends Error{
+  constructor(){super('The local file cannot be read and an identical account copy could not be verified.');}
+}
+const blobReadUnavailable=error=>error?.name==='NotFoundError'||error?.name==='NotReadableError';
+const blobWriteUnavailable=error=>error?.name==='UnknownError'&&error.message==='Error preparing Blob/File data to be stored in object store';
 export class MirroredFiles{
   #scope;#server;#content;#valid;#captureAbort=new AbortController();#db;#opening;#useByteRecords=false;#running;#closed=false;#listeners=new Set();#timer;#retryMs;#rateFailures=0;#online;#visibility;#hasPending=true;#nextScanRequest=null;#lastError=null;#scans={active:null,complete:null};
   constructor({scope,server,content=null,valid=()=>true,onChange=()=>{},retryMs=15000}={}){
@@ -126,7 +131,7 @@ export class MirroredFiles{
       catch(error){
         // WebKit can reject Blob records in ephemeral profiles. Retry only
         // after #tx confirms rollback of that specific failed transaction.
-        if(error?.name!=='UnknownError'||error.message!=='Error preparing Blob/File data to be stored in object store')throw error;
+        if(!blobWriteUnavailable(error))throw error;
         this.#useByteRecords=true;
       }
     }
@@ -296,15 +301,56 @@ export class MirroredFiles{
       return {...counts,next};
     });
   }
+  async #repairLegacyBlob(row,signal){
+    if(globalThis.navigator?.onLine===false)throw new UnreadableMirrorBlob();
+    let remote;
+    try{remote=await abortable(this.#server.read(row.path.slice(1),{signal}),signal);}
+    catch(error){if(error?.status===404)throw new UnreadableMirrorBlob();throw error;}
+    this.#check();
+    const size=remote?.data?.byteLength;
+    if(remote?.sha256!==row.sha256||size!==storedSize(row.data)||size>MAX_FILE)throw new UnreadableMirrorBlob();
+    const source=remote.data;
+    if(!(byteArray(source)||rawBuffer(source))||await digest(source)!==row.sha256)throw new UnreadableMirrorBlob();
+    this.#check();if(signal?.aborted)throw new DOMException('Cancelled','AbortError');
+    const blob=new Blob([source]);
+    const replacement=size<=MAX_INLINE_BYTES?bytes(source).buffer:blob;
+    const repaired=await this.#storeContent([replacement],([data])=>this.#update(row.path,current=>{
+      if(!current||current.version!==row.version||current.sha256!==row.sha256||current.deleted||current.directory||current.moving)return [undefined,false];
+      if(signal?.aborted)throw new DOMException('Cancelled','AbortError');
+      return [{...current,data},true];
+    }));
+    if(!repaired)throw new MirrorConflict();
+    this.#changed();return blob;
+  }
+  async #legacySnapshot(row,signal,repair){
+    const legacy=blobValue(row.data);
+    try{
+      const blob=await this.#blob(row.data,{signal});
+      if(this.#content?.verifyLegacy){await this.#content.verifyLegacy(blob,row.sha256,{signal});return blob;}
+      const buffer=await abortable(blob.arrayBuffer(),signal);
+      if(await digest(buffer)!==row.sha256){
+        if(legacy)throw new UnreadableMirrorBlob();
+        throw Error('Saved data failed verification.');
+      }
+      // Detach small legacy bytes from the IndexedDB backing before handing
+      // them to a reader or updating the record's upload journal.
+      return legacy&&buffer.byteLength<=MAX_INLINE_BYTES?new Blob([buffer]):blob;
+    }catch(error){
+      if(!legacy||!(error instanceof UnreadableMirrorBlob||blobReadUnavailable(error)))throw error;
+      if(!repair)throw new UnreadableMirrorBlob();
+      this.#check();if(signal?.aborted)throw new DOMException('Cancelled','AbortError');
+      return this.#repairLegacyBlob(row,signal);
+    }
+  }
   // Caller owns the returned lease and must release it after consuming data.
   async acquireSnapshot(path,options={}){return this.#acquireSnapshot(path,options,true);}
-  async #acquireSnapshot(path,{signal=null,expected=null}={},hydrate=false){
+  async #acquireSnapshot(path,{signal=null,expected=null}={},hydrate=false,repair=hydrate){
     path=filePath(path);if(signal?.aborted)throw new DOMException('Cancelled','AbortError');
     const row=await (hydrate?this.#lookupForRead(path,signal):abortable(this.#get(path),signal));need(row&&!row.deleted&&!row.directory,'File not found.');
     if(expected!==null&&row.version!==expected)throw new MirrorConflict();
     let lease;
     if(isContentRef(row.data)){need(this.#content&&typeof this.#content.acquire==='function','Verified storage is unavailable.');const pending=this.#content.acquire(row.data,{signal});try{lease=await abortable(pending,signal)}catch(e){Promise.resolve(pending).then(value=>value?.release?.(),()=>{});throw e;}}
-    else {const data=await this.#blob(row.data,{signal});if(this.#content?.verifyLegacy)await this.#content.verifyLegacy(data,row.sha256,{signal});else {const buffer=await abortable(data.arrayBuffer(),signal);need(await digest(buffer)===row.sha256,'Saved data failed verification.');}lease={data,release(){}};}
+    else lease={data:await this.#legacySnapshot(row,signal,repair),release(){}};
     try{this.#check();if(signal?.aborted)throw new DOMException('Cancelled','AbortError');const latest=await abortable(this.#get(path),signal);if(!latest||latest.version!==row.version||latest.deleted||latest.sha256!==row.sha256)throw new MirrorConflict();return {...lease,version:row.version,sha256:row.sha256,status:row.conflict?'conflict':row.dirty?'pending':'synced'};}
     catch(e){lease.release();throw e;}
   }
@@ -514,16 +560,16 @@ export class MirroredFiles{
   }
   // Persist the exact pending content hash before dispatch so a lost reply can
   // be recognized even if a later local edit supersedes this row.
-  async #rememberAttempt(row){return this.#update(row.path,current=>{
+  async #rememberAttempt(row,data){return this.#update(row.path,current=>{
     if(!current||current.version!==row.version||current.deleted||current.conflict||current.moving||current.base!==row.base||current.sha256!==row.sha256)return [undefined,false];
-    return [{...current,attempted:{base:row.base,sha256:row.sha256}},true];
+    return [{...current,data:data??current.data,attempted:{base:row.base,sha256:row.sha256}},true];
   });}
   async #rebaseAttempt(row,serverSHA){return this.#update(row.path,current=>{
     const attempt=current?.attempted;
     if(!current||current.conflict||current.moving||current.version!==row.version||current.base!==row.base||!attempt||attempt.base!==row.base||attempt.sha256!==serverSHA)return [undefined,null];
     const next={...current,base:serverSHA,attempted:null};return [next,next];
   });}
-  async #ack(row,base,{remove=false}={}){await this.#update(row.path,current=>{if(!current||current.conflict||current.moving)return [undefined,false];if(current.version===row.version)return [remove?null:{...current,base,attempted:null,dirty:false,conflict:false},true];if(current.base===row.base)return [{...current,base,attempted:null},false];return [undefined,false];});}
+  async #ack(row,base,{remove=false,data}={}){await this.#update(row.path,current=>{if(!current||current.conflict||current.moving)return [undefined,false];if(current.version===row.version)return [remove?null:{...current,data:data??current.data,base,attempted:null,dirty:false,conflict:false},true];if(current.base===row.base)return [{...current,base,attempted:null},false];return [undefined,false];});}
   async #conflict(row){await this.#update(row.path,current=>current?.version===row.version?[{...current,conflict:true},true]:[undefined,false]);}
   async #restoreCompatibleDirectory(row,remote,scan,cohort){
     const admissible=value=>value?.directory===true&&value.conflict===true&&value.deleted===false&&typeof value.version==='string'&&value.version.length>0&&
@@ -557,12 +603,36 @@ export class MirroredFiles{
   }
   async #readChanged(path,sha256,row){
     if(row?.data&&(row.data instanceof Blob||isContentRef(row.data))&&typeof this.#server.readChunked==='function'){
-      const lease=await this.#acquireSnapshot(path,{expected:row.version,signal:this.#captureAbort.signal},false);
-      try{return await this.#server.readChunked(path.slice(1),sha256,lease.data,{signal:this.#captureAbort.signal});}
-      finally{lease.release();}
+      let lease;
+      try{lease=await this.#acquireSnapshot(path,{expected:row.version,signal:this.#captureAbort.signal},false);}
+      catch(error){if(!(error instanceof UnreadableMirrorBlob))throw error;}
+      if(lease){
+        try{return await this.#server.readChunked(path.slice(1),sha256,lease.data,{signal:this.#captureAbort.signal});}
+        finally{lease.release();}
+      }
+      // A clean row with unreadable cached bytes cannot be used as a delta
+      // base. Fetch the account revision in full and let the caller verify it.
     }
     if(!row&&typeof this.#server.readBlob==='function')return this.#server.readBlob(path.slice(1),sha256,{signal:this.#captureAbort.signal});
     return this.#server.read(path.slice(1),{signal:this.#captureAbort.signal});
+  }
+  async #publishPendingFile(row,target,confirmed){
+    if(confirmed&&!blobValue(row.data)){await this.#ack(row,row.sha256);return true;}
+    const signal=this.#captureAbort.signal;
+    let lease;
+    try{
+      lease=await this.#acquireSnapshot(row.path,{expected:row.version,signal},false,confirmed);
+      const data=blobValue(row.data)&&lease.data.size<=MAX_INLINE_BYTES
+        ?await abortable(lease.data.arrayBuffer(),signal):undefined;
+      if(!confirmed){
+        if(!await this.#rememberAttempt(row,data)){this.#requestScan(true);return false;}
+        const payload=this.#server.acceptsBlobWrites===true?lease.data:new Uint8Array(data??await abortable(lease.data.arrayBuffer(),signal));
+        this.#check();
+        await this.#server.write(target,payload,row.base,{signal});
+      }
+      await this.#ack(row,row.sha256,{data});
+      return true;
+    }finally{lease?.release();}
   }
   async #pass(scan){
     this.#check();scan.attempts++;const canVersion=typeof this.#server.supportsVersion==='function'&&typeof this.#server.version==='function'&&await this.#server.supportsVersion({signal:this.#captureAbort.signal});
@@ -629,7 +699,7 @@ export class MirroredFiles{
       }
       return false;
     };
-    const dirty=rows.filter(row=>row.dirty&&!row.conflict&&!row.moving);
+    const dirty=rows.filter(row=>row.dirty&&!row.conflict&&!row.moving),issues=[];
     const pendingDirectories=new Set(dirty.filter(row=>row.directory&&row.deleted).map(row=>row.path));
     const localRows=new Map(rows.map(row=>[row.path,row]));
     const cacheVersions=async (items,start,pathOf)=>{
@@ -697,24 +767,28 @@ export class MirroredFiles{
       }else{
         if(existing?.directory){await this.#conflict(row);continue;}
         const current=existing?await version(target,existing):null;this.#check();
-        if(row.attempted&&row.attempted.base===row.base&&current?.sha256===row.attempted.sha256){
-          const rebased=await this.#rebaseAttempt(row,current.sha256);this.#check();
-          if(!rebased){this.#requestScan(true);continue;}row=rebased;
-        }
-        if(row.deleted){if(!current){await this.#ack(row,null,{remove:true});continue;}if(current.sha256!==row.base){await this.#conflict(row);continue;}await this.#server.remove(target,row.base,{signal:this.#captureAbort.signal});remote.delete(row.path);await this.#ack(row,null,{remove:true});}
-        else if(current?.sha256===row.sha256)await this.#ack(row,row.sha256);
-        else if((current?.sha256??null)!==row.base)await this.#conflict(row);
-        else{
-          if(!await this.#rememberAttempt(row)){this.#requestScan(true);continue;}
-          this.#check();const lease=await this.#acquireSnapshot(row.path,{expected:row.version,signal:this.#captureAbort.signal},false);
-          try{await this.#server.write(target,this.#server.acceptsBlobWrites===true?lease.data:new Uint8Array(await lease.data.arrayBuffer()),row.base,{signal:this.#captureAbort.signal});}
-          finally{lease.release();}
-          remote.set(row.path,{directory:false,sha256:row.sha256});await this.#ack(row,row.sha256);
+        try{
+          const confirmed=!row.deleted&&current?.sha256===row.sha256;
+          if(!confirmed&&row.attempted&&row.attempted.base===row.base&&current?.sha256===row.attempted.sha256){
+            const rebased=await this.#rebaseAttempt(row,current.sha256);this.#check();
+            if(!rebased){this.#requestScan(true);continue;}row=rebased;
+          }
+          if(row.deleted){
+            if(!current){await this.#ack(row,null,{remove:true});continue;}
+            if(current.sha256!==row.base){await this.#conflict(row);continue;}
+            await this.#server.remove(target,row.base,{signal:this.#captureAbort.signal});
+            remote.delete(row.path);await this.#ack(row,null,{remove:true});
+          }else if(!confirmed&&(current?.sha256??null)!==row.base)await this.#conflict(row);
+          else if(await this.#publishPendingFile(row,target,confirmed))remote.set(row.path,{directory:false,sha256:row.sha256});
+        }catch(error){
+          if(!blobValue(row.data)||!(error instanceof UnreadableMirrorBlob||blobWriteUnavailable(error)))throw error;
+          this.#check();
+          issues.push('Could not sync '+row.path+': '+error.message);
         }
       }
     }
     // Re-read current local rows: an edit can arrive while the server is slow.
-    const fresh=await this.#all(),local=new Map(fresh.map(r=>[r.path,r])),issues=[];
+    const fresh=await this.#all(),local=new Map(fresh.map(r=>[r.path,r]));
     const entries=[...remote];
     const unresolvedRoots=fresh.filter(row=>row.directory&&row.conflict).map(row=>row.path);
     const reusable=(path,row,item)=>{
