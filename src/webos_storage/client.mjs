@@ -54,6 +54,9 @@ async function runFileWorker(workerUrl,operation,blob,check=()=>{},signal=null,e
     }catch(error){finish(error)}
   })}finally{worker.terminate()}
 }
+// POSTs need the site's Origin for gateway verification. Limit Referer to the origin.
+const POST_REFERRER_POLICY = 'strict-origin';
+
 export class UserFiles{
   #activeRequests=0;
   #requestWaiters=[];
@@ -75,7 +78,7 @@ export class UserFiles{
   }
   async post(path,body,{headers={},timeout=15000}={}){
     this.check();
-    const response=await fetch(path,{method:'POST',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:'no-referrer',
+    const response=await fetch(path,{method:'POST',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:POST_REFERRER_POLICY,
       headers:{'Content-Type':'application/json',...headers},body,signal:AbortSignal.timeout(timeout)});
     const reader=response.body.getReader(),chunks=[];let size=0;
     try{
@@ -90,7 +93,7 @@ export class UserFiles{
     if(!response.ok)throw new FileRequestError(value?.error||'File request failed',response.status,response.headers.get('Retry-After'));return value;
   }
   async postBinary(path,body,headers){
-    this.check();const response=await fetch(path,{method:'POST',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:'no-referrer',headers:{'Content-Type':'application/json',...headers},body,signal:AbortSignal.timeout(910000)});
+    this.check();const response=await fetch(path,{method:'POST',mode:'same-origin',credentials:'same-origin',redirect:'error',cache:'no-store',referrerPolicy:POST_REFERRER_POLICY,headers:{'Content-Type':'application/json',...headers},body,signal:AbortSignal.timeout(910000)});
     if(!response.ok){let value;try{value=await response.json()}catch{value={}}throw new FileRequestError(value.error||'File request failed',response.status,response.headers.get('Retry-After'));}
     const lengthText=response.headers.get('Content-Length'),sha256=response.headers.get('X-Codi-File-SHA256');
     requireThat(response.headers.get('Content-Type')==='application/octet-stream'&&typeof lengthText==='string'&&/^(0|[1-9][0-9]*)$/.test(lengthText)&&typeof sha256==='string'&&/^[0-9a-f]{64}$/.test(sha256),'Invalid binary file response');
