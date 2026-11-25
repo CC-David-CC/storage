@@ -513,20 +513,69 @@ export class MirroredFiles{
     }
     // Keep pending changes below a directory conflict on this device.
     const conflictedDirectories=new Set(rows.filter(row=>row.directory&&row.conflict).map(row=>row.path));
-    const underDirectoryConflict=path=>{
+    const hasAncestor=(path,paths)=>{
       for(let ancestor=parent(path);ancestor!=='/';ancestor=parent(ancestor)){
-        if(conflictedDirectories.has(ancestor))return true;
+        if(paths.has(ancestor))return true;
       }
       return false;
     };
+    const dirty=rows.filter(row=>row.dirty&&!row.conflict&&!row.moving);
+    const pendingDirectories=new Set(dirty.filter(row=>row.directory&&row.deleted).map(row=>row.path));
+    const localRows=new Map(rows.map(row=>[row.path,row]));
+    const cacheVersions=async (items,start,pathOf)=>{
+      const request=[];let length=0;
+      for(let index=start;index<items.length;index++){
+        const path=pathOf(items[index]);
+        if(!path)continue;
+        const item=remote.get(path),relative=path.slice(1);
+        if(!item||item.directory||item.sha256||batchCache.has(relative))continue;
+        const size=new TextEncoder().encode(relative).length;
+        if(length+size>8192||request.length===16)break;
+        request.push(relative);length+=size;
+      }
+      if(!request.length)return;
+      const values=await this.#server.versions(request,{signal:this.#captureAbort.signal});
+      this.#check();
+      need(Array.isArray(values)&&values.length===request.length,'Invalid batch file versions.');
+      for(const [index,path] of request.entries())batchCache.set(path,values[index]);
+    };
+    // Check the account subtree before dispatching any of its queued deletes.
+    // Otherwise a child could disappear before a later parent reports a conflict.
+    for(const path of pendingDirectories){
+      if(hasAncestor(path,pendingDirectories)||hasAncestor(path,conflictedDirectories))continue;
+      const children=[...remote].filter(([relative])=>relative===path||relative.startsWith(path+'/'));
+      let changed=children.some(([relative,item])=>{
+        const local=localRows.get(relative);
+        return !local?.deleted||!local.dirty||local.conflict||local.moving||
+          local.directory!==item.directory||(item.directory&&local.base!=='dir');
+      });
+      if(!changed){
+        const files=children.filter(([,item])=>!item.directory).map(([relative])=>relative);
+        for(const [index,relative] of files.entries()){
+          if(canBatch&&!remote.get(relative).sha256&&!batchCache.has(relative.slice(1)))await cacheVersions(files,index,value=>value);
+          const target=relative.slice(1);
+          const current=await version(target,remote.get(relative));
+          this.#check();
+          if(current?.sha256!==localRows.get(relative).base){changed=true;break;}
+          batchCache.set(target,{sha256:current.sha256});
+        }
+      }
+      if(changed){
+        conflictedDirectories.add(path);
+        await this.#conflict(localRows.get(path));
+      }
+    }
     // Create parents before children; remove children before parents.
-    const dirty=rows.filter(r=>r.dirty&&!r.conflict&&!r.moving).sort((a,b)=>(a.deleted?1:0)-(b.deleted?1:0)||(a.deleted?b.path.length-a.path.length:a.path.length-b.path.length));
-    for(let index=0;index<dirty.length;index++){let row=dirty[index];this.#check();if(underDirectoryConflict(row.path))continue;if(isContentRef(row.data))need(row.sha256===row.data.sha256,'Stored content metadata is inconsistent.');const existing=remote.get(row.path),target=row.path.slice(1);
-      // Updating existing files needs their server versions. Fetch a bounded
-      // group together; the eventual write/delete still enforces its base hash.
+    dirty.sort((a,b)=>(a.deleted?1:0)-(b.deleted?1:0)||(a.deleted?b.path.length-a.path.length:a.path.length-b.path.length));
+    for(let index=0;index<dirty.length;index++){
+      let row=dirty[index];
+      this.#check();
+      if(conflictedDirectories.has(row.path)||hasAncestor(row.path,conflictedDirectories))continue;
+      if(isContentRef(row.data))need(row.sha256===row.data.sha256,'Stored content metadata is inconsistent.');
+      const existing=remote.get(row.path),target=row.path.slice(1);
+      // The eventual write/delete still enforces its base hash.
       if(canBatch&&!row.directory&&existing&&!existing.directory&&!existing.sha256&&!batchCache.has(target)){
-        const paths=[];let length=0;for(let i=index;i<dirty.length&&paths.length<16;i++){const candidate=dirty[i],entry=remote.get(candidate.path),relative=candidate.path.slice(1),size=new TextEncoder().encode(relative).length;if(candidate.directory||!entry||entry.directory||entry.sha256||batchCache.has(relative))continue;if(length+size>8192)break;paths.push(relative);length+=size;}
-        if(paths.length){const values=await this.#server.versions(paths,{signal:this.#captureAbort.signal});this.#check();need(Array.isArray(values)&&values.length===paths.length,'Invalid batch file versions.');for(let i=0;i<paths.length;i++)batchCache.set(paths[i],values[i]);}
+        await cacheVersions(dirty,index,item=>item.directory?null:item.path);
       }
       if(row.directory){
         if(row.deleted){if(existing){if(!existing.directory||[...remote.keys()].some(p=>parent(p)===row.path)){await this.#conflict(row);continue;}await this.#server.remove(target,null,{signal:this.#captureAbort.signal});remote.delete(row.path);}await this.#ack(row,null,{remove:true});}
@@ -703,6 +752,44 @@ export class MirroredFiles{
       this.#changed();
       this.#queueSync();
     }finally{stopValidity();}
+  }
+
+  async cancelFolderDeletion(path,expected){
+    path=filePath(path);
+    need(path!=='/'&&typeof expected==='string','Select the pending folder deletion.');
+    const observe=rows=>{
+      const tree=rows.filter(row=>row.path===path||row.path.startsWith(path+'/'));
+      const root=tree.find(row=>row.path===path);
+      if(!root?.directory||!root.deleted||!root.conflict||root.version!==expected){
+        throw new MirrorConflict('The pending folder deletion changed. Select it again.');
+      }
+      if(tree.some(row=>!row.deleted||row.moving)){
+        throw new MirrorConflict('The device folder changed. Refresh before canceling the deletion.');
+      }
+      return tree;
+    };
+    await this.#exclusive(()=>this.#withPublicationLock(async()=>{
+      const selected=observe(await this.#all());
+      const versions=new Map(selected.map(row=>[row.path,row.version]));
+      const inventory=await this.#remoteInventory();
+      const replacement=await this.#accountRecord(path,inventory.get(path));
+      await this.#storeContent([replacement?.data],([data])=>this.#tx('readwrite',(store,done,fail)=>{
+        const request=store.index('scope').getAll(this.#scope);
+        request.onsuccess=()=>{try{
+          this.#check();
+          const current=observe(request.result);
+          if(current.length!==versions.size||current.some(row=>versions.get(row.path)!==row.version)){
+            throw new MirrorConflict('The device folder changed. Refresh before canceling the deletion.');
+          }
+          for(const row of current)store.delete([this.#scope,row.path]);
+          if(replacement)store.put({...replacement,data});
+          done(true);
+        }catch(error){fail(error);}};
+        request.onerror=()=>fail(request.error);
+      }));
+    }));
+    this.#changed();
+    this.#queueSync();
   }
 
   async resolve(path,choice,expected,internal=null){

@@ -36,7 +36,15 @@ function setup(t) {
       if(parent&&!entries.get(parent)?.directory)throw Object.assign(Error('Parent folder unavailable.'),{status:409});
       mutations++; throw Error('Unexpected write');
     },
-    async remove() {check(); mutations++; throw Error('Unexpected deletion');}
+    async remove(path, expected) {
+      check();
+      const current=entries.get(path);
+      if(!current||(current.directory?expected!==null:current.sha256!==expected)||[...entries.keys()].some(name=>name.startsWith(path+'/'))) {
+        throw Object.assign(Error('Deletion precondition changed.'),{status:409});
+      }
+      mutations++;
+      entries.delete(path);
+    }
   };
   const mirror = new MirroredFiles({scope:crypto.randomUUID(),server,retryMs:0});
   t.after(() => mirror.close());
@@ -152,5 +160,69 @@ test('confirming a folder copy preserves local children until the exact account 
   assert.equal(new TextDecoder().decode((await mirror.read('/Project')).data),'account file at the original path');
   assert.equal(new TextDecoder().decode((await mirror.read('/Project-copy/note.txt')).data),'device note');
   assert.equal((await mirror.list('/Project-copy/Empty')).entries.length,0);
+  assert.equal(mutations(),0);
+});
+
+test('a pending folder deletion protects its account children until the device cancels it',async t=>{
+  const {entries,mirror,setOffline,mutations}=setup(t);
+  entries.set('Project',{directory:true});
+  entries.set('Project/note.txt',entry('first account note'));
+  entries.set('Project/other.txt',entry('other account note'));
+  await mirror.sync();
+  const initial=(await mirror.list('/')).entries.find(item=>item.name==='Project');
+  setOffline(true);
+  for(const item of (await mirror.list('/Project')).entries)await mirror.remove(item.path,item.version);
+  await mirror.remove('/Project',initial.version);
+  await waitUntilOffline(mirror);
+  entries.set('Project/note.txt',entry('updated in another session'));
+  entries.set('Project/new.txt',entry('added in another session'));
+  setOffline(false);
+  await mirror.sync();
+  await mirror.sync(); // Background retries must keep every child intact.
+  const conflict=(await mirror.list('/')).entries.find(item=>item.name==='Project');
+  assert.equal(conflict.deleted,true);
+  assert.equal(conflict.status,'conflict');
+  assert.equal(mutations(),0);
+  await assert.rejects(mirror.cancelFolderDeletion('/Project',initial.version),/changed/i);
+  await mirror.cancelFolderDeletion('/Project',conflict.version);
+  await mirror.sync();
+  assert.deepEqual((await mirror.list('/Project')).entries.map(item=>item.name),['new.txt','note.txt','other.txt']);
+  assert.equal(new TextDecoder().decode((await mirror.read('/Project/note.txt')).data),'updated in another session');
+  assert.equal(mutations(),0);
+});
+
+test('an unchanged pending folder deletion can still finish after its selected children',async t=>{
+  const {entries,mirror,setOffline,mutations}=setup(t);
+  entries.set('Project',{directory:true});
+  entries.set('Project/note.txt',entry('first account note'));
+  await mirror.sync();
+  const root=(await mirror.list('/')).entries.find(item=>item.name==='Project');
+  const [note]=(await mirror.list('/Project')).entries;
+  setOffline(true);
+  await mirror.remove(note.path,note.version);
+  await mirror.remove(root.path,root.version);
+  await waitUntilOffline(mirror);
+  setOffline(false);
+  await mirror.sync();
+  assert.equal(entries.has('Project'),false);
+  assert.equal(entries.has('Project/note.txt'),false);
+  assert.equal(mutations(),2);
+});
+
+test('canceling a pending folder deletion adopts an account file at that path',async t=>{
+  const {entries,mirror,setOffline,mutations}=setup(t);
+  entries.set('Project',{directory:true});
+  await mirror.sync();
+  const root=(await mirror.list('/')).entries.find(item=>item.name==='Project');
+  setOffline(true);
+  await mirror.remove(root.path,root.version);
+  await waitUntilOffline(mirror);
+  entries.set('Project',entry('replacement account file'));
+  setOffline(false);
+  await mirror.sync();
+  const conflict=(await mirror.list('/')).entries.find(item=>item.name==='Project');
+  assert.equal(conflict.status,'conflict');
+  await mirror.cancelFolderDeletion(conflict.path,conflict.version);
+  assert.equal(new TextDecoder().decode((await mirror.read('/Project')).data),'replacement account file');
   assert.equal(mutations(),0);
 });
