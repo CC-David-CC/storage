@@ -44,7 +44,7 @@ function abortable(task,signal){
 export class MirrorConflict extends Error{constructor(message='This file changed on another device. Choose which copy to keep.'){super(message);this.name='MirrorConflict';}}
 export class MirrorCommitUncertain extends Error{constructor(){super('Account changed after a local storage transaction committed. Reopen the original account and check the file before retrying.');this.name='MirrorCommitUncertain';}}
 export class MirroredFiles{
-  #scope;#server;#content;#valid;#captureAbort=new AbortController();#db;#opening;#running;#closed=false;#listeners=new Set();#timer;#retryMs;#rateFailures=0;#online;#visibility;#hasPending=true;#nextScanRequest=null;#lastError=null;#scans={active:null,complete:null};
+  #scope;#server;#content;#valid;#captureAbort=new AbortController();#db;#opening;#blobRecords;#running;#closed=false;#listeners=new Set();#timer;#retryMs;#rateFailures=0;#online;#visibility;#hasPending=true;#nextScanRequest=null;#lastError=null;#scans={active:null,complete:null};
   constructor({scope,server,content=null,valid=()=>true,onChange=()=>{},retryMs=15000}={}){
     need(typeof scope==='string'&&scope.length>0&&scope.length<=512&&server&&typeof valid==='function'&&typeof onChange==='function','Authenticated file mirror required.');
     need(typeof retryMs==='number'&&Number.isFinite(retryMs)&&retryMs>=0,'Invalid sync retry interval.');
@@ -94,6 +94,31 @@ export class MirroredFiles{
       tx.oncomplete=()=>{try{this.#check();resolve(result);}catch(e){reject(mode==='readwrite'?new MirrorCommitUncertain():e);}};tx.onabort=tx.onerror=()=>reject(problem||tx.error||Error('Browser file storage failed.'));
       try{action(store,value=>{result=value;},fail);}catch(e){fail(e);}
     });
+  }
+  async #legacyData(blob){
+    // Some WebKit profiles reject Blob records while accepting ArrayBuffers.
+    // Commit the probe's put and delete together, leaving no file or account
+    // metadata behind. Keep unrelated storage errors visible to the caller.
+    this.#blobRecords??=this.#tx('readwrite',(store,done,fail)=>{
+      const [scope,path]=['codi-file-mirror-probe','blob'];
+      const request=store.put({scope,path,data:new Blob(['1'])});
+      request.onerror=()=>fail(request.error);
+      request.onsuccess=()=>{
+        try{
+          const cleanup=store.delete([scope,path]);
+          cleanup.onerror=()=>fail(cleanup.error);
+          cleanup.onsuccess=()=>done(true);
+        }catch(error){fail(error);}
+      };
+    }).catch(error=>{
+      if(error?.name==='UnknownError'&&error.message==='Error preparing Blob/File data to be stored in object store')return false;
+      this.#blobRecords=null;
+      throw error;
+    });
+    const supportsBlob=await this.#blobRecords;this.#check();
+    if(supportsBlob)return blob;
+    const snapshot=await abortable(blob.arrayBuffer(),this.#captureAbort.signal);
+    this.#check();return snapshot;
   }
   async #all(){return this.#tx('readonly',(store,done,fail)=>{const request=store.index('scope').getAll(this.#scope);request.onsuccess=()=>done(request.result);request.onerror=()=>fail(request.error);});}
   async #get(path){const row=await this.#tx('readonly',(store,done,fail)=>{const request=store.get([this.#scope,path]);request.onsuccess=()=>done(request.result||null);request.onerror=()=>fail(request.error);});if(isContentRef(row?.data))need(row.sha256===row.data.sha256,'Stored content metadata is inconsistent.');return row;}
@@ -277,6 +302,7 @@ export class MirroredFiles{
       // Older server adapters retain their original capture behavior.
       const snapshot=incoming?await incoming.arrayBuffer():copy;sha256=await digest(snapshot);stored=new Blob([snapshot]);this.#check();
     }
+    if(!this.#content)stored=await this.#legacyData(stored);
     const result=await this.#mutate(path,(old,all)=>{if(parent(path)!=='/'){const p=all.find(r=>r.path===parent(path));need(p&&!p.deleted&&p.directory,'Create the parent folder first.');}need(all.length<MAX_ENTRIES||old,'Browser file limit reached.');if(old?.moving)throw Error('Wait for this move to finish syncing.');if(old?.conflict)throw new MirrorConflict('Resolve the file conflict in Files before saving.');if(expected===null?!!old:!old||old.deleted||old.directory||old.version!==expected)throw new MirrorConflict('This file changed; reload it before saving.');
       const row={scope:this.#scope,path,directory:false,data:stored,sha256,base:old?.base??null,attempted:old?.attempted??null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:!!old?.conflict};return [row,{path,version:row.version,sha256,status:row.conflict?'conflict':'pending'}];});
     this.#hasPending=true;this.#changed();this.#queueSync();return result;
@@ -337,7 +363,7 @@ export class MirroredFiles{
           const result=await this.#server.captureSnapshot(new Blob([data]),{signal:this.#captureAbort.signal});this.#check();
           need(result?.blob instanceof Blob&&result.blob.size===data.length&&typeof result.sha256==='string'&&/^[0-9a-f]{64}$/.test(result.sha256),'Invalid file capture.');stored=result.blob;hash=result.sha256;
         }else{hash=await digest(data);stored=new Blob([data]);this.#check();}
-        rows.push({path,directory:false,data:stored,sha256:hash});}
+        rows.push({path,directory:false,data:await this.#legacyData(stored),sha256:hash});}
     }
     const directories=new Set(rows.filter(r=>r.directory).map(r=>r.path));
     for(const row of rows.slice(1))need(directories.has(parent(row.path)),'Archive is missing a parent folder.');
@@ -418,7 +444,7 @@ export class MirroredFiles{
   }
   async #install(row,remote){const installed=await this.#update(row.path,current=>{if(row.version===null?!!current:!current||current.version!==row.version||current.dirty)return [undefined,false];return [{scope:this.#scope,path:row.path,directory:remote.directory,data:remote.data??null,sha256:remote.sha256??null,base:remote.directory?'dir':remote.sha256,version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false},true];});if(installed)this.#changed();return installed;}
   async #installRemote(row,value){
-    if(!this.#content)return this.#install(row,{directory:false,data:new Blob([value.data]),sha256:value.sha256});
+    if(!this.#content)return this.#install(row,{directory:false,data:await this.#legacyData(new Blob([value.data])),sha256:value.sha256});
     return this.#withPublicationLock(async()=>{
       this.#check();const source=new Blob([value.data]);need(source.size<=MAX_FILE&&/^[0-9a-f]{64}$/.test(value.sha256??''),'Invalid remote file.');
       const ref=await this.#content.capture(source);this.#check();need(isContentRef(ref)&&ref.size===source.size&&ref.sha256===value.sha256,'Remote file failed verification.');
@@ -598,6 +624,7 @@ export class MirroredFiles{
     if(choice==='local'){await this.#update(path,current=>{if(!current||current.version!==expected)throw new MirrorConflict();return [{...current,base:remote?.sha256??null,attempted:null,conflict:false,dirty:true},true];});}
     else{let stored=remote?new Blob([remote.data]):null;
       if(remote&&this.#content){const ref=await this.#content.capture(stored);this.#check();need(isContentRef(ref)&&ref.size===stored.size&&ref.sha256===remote.sha256,'Remote file failed verification.');stored=ref;}
+      else if(remote)stored=await this.#legacyData(stored);
       await this.#update(path,current=>{if(!current||current.version!==expected)throw new MirrorConflict();if(!remote)return [null,true];return [{scope:this.#scope,path,directory:false,data:stored,sha256:remote.sha256,base:remote.sha256,version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false},true];});}
     this.#changed();if(choice==='local'){this.#hasPending=true;this.#queueSync();}
     }finally{stopValidity()}
