@@ -168,7 +168,7 @@ export class MirroredFiles{
       const request=store.index('scope').getAll(this.#scope);
       request.onsuccess=()=>{try{
         this.#check();
-        const all=request.result;
+        const all=request.result,added=[];
         for(const folder of accountParents){
           const current=all.find(row=>row.path===folder);
           if(current){
@@ -180,12 +180,26 @@ export class MirroredFiles{
           const row={scope:this.#scope,path:folder,directory:true,data:null,sha256:null,base:'dir',
             version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false};
           all.push(row);
-          store.put(row);
+          added.push(row);
         }
         const [next,result]=fn(all.find(row=>row.path===path)||null,all);
-        if(next===null)store.delete([this.#scope,path]);
-        else if(next!==undefined)store.put(next);
-        done(result);
+        const finish=()=>{
+          for(const row of added)store.put(row);
+          done(result);
+        };
+        if(next===null){
+          store.delete([this.#scope,path]);
+        }else if(next!==undefined){
+          const write=store.put(next);
+          if(added.length){
+            // WebKit must finish preparing a Blob before more requests are
+            // queued. If Blob preparation fails, the byte retry uses a new
+            // transaction after rollback.
+            write.onsuccess=()=>{try{finish();}catch(error){fail(error);}};
+            return;
+          }
+        }
+        finish();
       }catch(error){fail(error);}};
       request.onerror=()=>fail(request.error);
     });

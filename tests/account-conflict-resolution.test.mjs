@@ -232,11 +232,27 @@ test('saving to a new account-only folder confirms the parent and preserves the 
   await mirror.sync();
   entries.set('Project',{directory:true});
   entries.set('Project/Nested',{directory:true});
+  const puts=[];
+  const put=IDBObjectStore.prototype.put;
+  IDBObjectStore.prototype.put=function(value,...args){
+    puts.push([value.path,value.data?.constructor.name]);
+    if(value.path==='/Project/Nested/draft.txt'&&value.data instanceof Blob){
+      throw new DOMException('Error preparing Blob/File data to be stored in object store','UnknownError');
+    }
+    return put.call(this,value,...args);
+  };
+  t.after(()=>{IDBObjectStore.prototype.put=put;});
   const original=bytes('captured before lookup');
   const saving=mirror.write('/Project/Nested/draft.txt',original);
   original.fill(0);
   const saved=await saving;
   assert.equal(saved.status,'pending');
+  assert.deepEqual(puts.slice(0,4),[
+    ['/Project/Nested/draft.txt','Blob'],
+    ['/Project/Nested/draft.txt','ArrayBuffer'],
+    ['/Project',undefined],
+    ['/Project/Nested',undefined]
+  ]);
   assert.equal(new TextDecoder().decode((await mirror.read('/Project/Nested/draft.txt')).data),'captured before lookup');
   assert.equal((await mirror.list('/Project')).entries[0].status,'synced');
   setOffline(true);
