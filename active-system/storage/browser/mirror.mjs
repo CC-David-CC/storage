@@ -19,6 +19,9 @@ const name=path=>path.slice(path.lastIndexOf('/')+1);
 // ArrayBuffer.isView works across iframe realms. Copy synchronously before the
 // first await: callers may mutate their input while the digest is pending.
 const byteArray=value=>ArrayBuffer.isView(value)&&Object.prototype.toString.call(value)==='[object Uint8Array]';
+// Keep small, already-owned buffers inline so IndexedDB can update their
+// sync metadata without reusing a browser-managed Blob file.
+const MAX_INLINE_BYTES=64*1024;
 const rawBuffer=value=>Object.prototype.toString.call(value)==='[object ArrayBuffer]';
 const blobValue=value=>['[object Blob]','[object File]'].includes(Object.prototype.toString.call(value));
 const bytes=value=>typeof value==='string'?new TextEncoder().encode(value):byteArray(value)?new Uint8Array(value):rawBuffer(value)?new Uint8Array(ArrayBuffer.prototype.slice.call(value,0)):null;
@@ -375,7 +378,7 @@ export class MirroredFiles{
       // These bytes already belong to the mirror. Native hashing needs no
       // worker download or additional source read.
       sha256=await digest(copy);this.#check();
-      stored=new Blob([copy]);
+      stored=copy.byteLength<=MAX_INLINE_BYTES?copy.buffer:new Blob([copy]);
     }else if(globalThis.navigator?.onLine===false){
       const parts=[],check=()=>this.#check();
       sha256=await hashBlobOnDevice(incoming,check,parts);

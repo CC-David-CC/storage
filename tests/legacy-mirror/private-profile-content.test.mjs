@@ -85,3 +85,34 @@ test('a committed write with a lost account binding is never replayed', async ()
     reopened.close();
   }
 });
+
+test('small generated files keep owned bytes across mirror metadata writes', async () => {
+  const dataByPath = new Map();
+  const originalPut = IDBObjectStore.prototype.put;
+  const mirror = new MirroredFiles({scope:'inline-generated', server:offline, retryMs:0});
+  try {
+    IDBObjectStore.prototype.put = function(record) {
+      dataByPath.set(record.path, record.data);
+      return originalPut.call(this, record);
+    };
+    const example = 'voltage_v,current_ma\n1,1\n';
+    const saved = await mirror.write('/example.csv', example);
+    assert.ok(dataByPath.get('/example.csv') instanceof ArrayBuffer);
+    assert.equal(decode((await mirror.read('/example.csv')).data), example);
+
+    const edited = encode('π');
+    const write = mirror.write('/example.csv', edited, saved.version);
+    edited.fill(0);
+    await write;
+    assert.ok(dataByPath.get('/example.csv') instanceof ArrayBuffer);
+    assert.equal(decode((await mirror.read('/example.csv')).data), 'π');
+
+    await mirror.write('/large.csv', new Uint8Array(64 * 1024 + 1));
+    assert.ok(dataByPath.get('/large.csv') instanceof Blob);
+    await mirror.write('/upload.csv', new Blob([example]));
+    assert.ok(dataByPath.get('/upload.csv') instanceof Blob);
+  } finally {
+    IDBObjectStore.prototype.put = originalPut;
+    mirror.close();
+  }
+});
