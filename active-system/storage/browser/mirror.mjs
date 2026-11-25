@@ -163,7 +163,55 @@ export class MirroredFiles{
   }
   async #update(path,fn){return this.#tx('readwrite',(store,done,fail)=>{const request=store.get([this.#scope,path]);request.onsuccess=()=>{try{this.#check();const [next,result]=fn(request.result||null);if(next===null)store.delete([this.#scope,path]);else if(next!==undefined)store.put(next);done(result);}catch(e){fail(e);}};request.onerror=()=>fail(request.error);});}
   // Validate hierarchy and write within one IndexedDB transaction across tabs.
-  async #mutate(path,fn){return this.#tx('readwrite',(store,done,fail)=>{const request=store.index('scope').getAll(this.#scope);request.onsuccess=()=>{try{this.#check();const all=request.result,old=all.find(r=>r.path===path)||null;const [next,result]=fn(old,all);if(next===null)store.delete([this.#scope,path]);else if(next!==undefined)store.put(next);done(result);}catch(e){fail(e);}};request.onerror=()=>fail(request.error);});}
+  async #mutate(path,fn,accountParents=[]){
+    return this.#tx('readwrite',(store,done,fail)=>{
+      const request=store.index('scope').getAll(this.#scope);
+      request.onsuccess=()=>{try{
+        this.#check();
+        const all=request.result;
+        for(const folder of accountParents){
+          const current=all.find(row=>row.path===folder);
+          if(current){
+            if(!current.directory||current.deleted||current.conflict||current.moving){
+              throw new MirrorConflict('The destination folder changed. Reopen it before saving.');
+            }
+            continue;
+          }
+          const row={scope:this.#scope,path:folder,directory:true,data:null,sha256:null,base:'dir',
+            version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false};
+          all.push(row);
+          store.put(row);
+        }
+        const [next,result]=fn(all.find(row=>row.path===path)||null,all);
+        if(next===null)store.delete([this.#scope,path]);
+        else if(next!==undefined)store.put(next);
+        done(result);
+      }catch(error){fail(error);}};
+      request.onerror=()=>fail(request.error);
+    });
+  }
+  async #accountParents(path){
+    const folder=parent(path);
+    if(folder==='/'||await this.#get(folder))return [];
+    need(globalThis.navigator?.onLine!==false,'Create the parent folder first.');
+    const stopValidity=this.#watchValidity();
+    try{
+      const containingFolder=parent(folder);
+      // Listing the containing folder proves its entire path and the selected
+      // child's type. Avoid waiting for a scan or downloading other files.
+      const result=await abortable(this.#server.list(containingFolder.slice(1),{signal:this.#captureAbort.signal}),
+        this.#captureAbort.signal);
+      this.#check();
+      need(Array.isArray(result?.entries)&&result.entries.length<=MAX_ENTRIES,'Invalid account folder listing.');
+      need(result.entries.some(item=>item?.name===name(folder)&&item.directory===true),'Create the parent folder first.');
+      const folders=[];
+      for(let current=folder;current!=='/';current=parent(current))folders.unshift(current);
+      return folders;
+    }catch(error){
+      if(error.status===404)throw Error('Create the parent folder first.');
+      throw error;
+    }finally{stopValidity();}
+  }
   async #blob(value,{signal=null}={}){
     if(isContentRef(value)){need(this.#content&&typeof this.#content.read==='function','This browser needs the updated file storage.');const blob=await this.#content.read(value,{signal});this.#check();need(blob instanceof Blob&&blob.size===value.size,'Stored content is unavailable.');return blob;}
     need(blobValue(value)||rawBuffer(value),'Invalid stored content.');return new Blob([value]);
@@ -271,17 +319,19 @@ export class MirroredFiles{
     return this.#readBytes(path,maximumBytes,signal);
   }
   async write(path,data,expected=null){
-    // Copy mutable caller bytes before waiting for a cross-tab lock.
-    if(this.#content&&!blobValue(data)&&(byteArray(data)||rawBuffer(data))){need(data.byteLength<=MAX_FILE,'Files are limited to 128 MiB.');data=bytes(data);}
-    return this.#withPublicationLock(()=>this.#write(path,data,expected));
-  }
-  async #write(path,data,expected=null){
-    this.#check();const stopValidity=this.#watchValidity();try{
-    path=filePath(path);need(path!=='/','Enter a filename.');const incoming=blobValue(data)?data:null;
-    // Reject oversize byte inputs before allocating a snapshot of them.
+    this.#check();
+    path=filePath(path);need(path!=='/','Enter a filename.');
+    const incoming=blobValue(data)?data:null;
+    // Size-check and copy mutable bytes before any folder lookup or lock wait.
     const hint=incoming?incoming.size:byteArray(data)||rawBuffer(data)?data.byteLength:null;
     if(hint!==null)need(Number.isSafeInteger(hint)&&hint<=MAX_FILE,'Files are limited to 128 MiB.');
-    const copy=incoming?null:bytes(data),size=incoming?incoming.size:copy?.length;need(Number.isSafeInteger(size)&&size<=MAX_FILE,'Files are limited to 128 MiB.');
+    const copy=incoming?null:bytes(data),size=incoming?incoming.size:copy?.length;
+    need(Number.isSafeInteger(size)&&size<=MAX_FILE,'Files are limited to 128 MiB.');
+    const accountParents=await this.#accountParents(path);
+    return this.#withPublicationLock(()=>this.#write(path,incoming,copy,size,expected,accountParents));
+  }
+  async #write(path,incoming,copy,size,expected,accountParents){
+    this.#check();const stopValidity=this.#watchValidity();try{
     // A File from an upload picker can still reference the source on disk even
     // after IndexedDB stores it. Snapshot it before the picker source vanishes.
     // The worker verifies the captured bytes against a second source pass;
@@ -298,11 +348,27 @@ export class MirroredFiles{
       const snapshot=incoming?await incoming.arrayBuffer():copy;sha256=await digest(snapshot);stored=new Blob([snapshot]);this.#check();
     }
     const result=await this.#storeContent([stored],([record])=>this.#mutate(path,(old,all)=>{if(parent(path)!=='/'){const p=all.find(r=>r.path===parent(path));need(p&&!p.deleted&&p.directory,'Create the parent folder first.');}need(all.length<MAX_ENTRIES||old,'Browser file limit reached.');if(old?.moving)throw Error('Wait for this move to finish syncing.');if(old?.conflict)throw new MirrorConflict('Resolve the file conflict in Files before saving.');if(expected===null?!!old:!old||old.deleted||old.directory||old.version!==expected)throw new MirrorConflict('This file changed; reload it before saving.');
-      const row={scope:this.#scope,path,directory:false,data:record,sha256,base:old?.base??null,attempted:old?.attempted??null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:!!old?.conflict};return [row,{path,version:row.version,sha256,status:row.conflict?'conflict':'pending'}];}));
+      const row={scope:this.#scope,path,directory:false,data:record,sha256,base:old?.base??null,attempted:old?.attempted??null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:!!old?.conflict};return [row,{path,version:row.version,sha256,status:row.conflict?'conflict':'pending'}];},accountParents));
     this.#hasPending=true;this.#changed();this.#queueSync();return result;
     }finally{stopValidity()}
   }
-  async mkdir(path){path=filePath(path);need(path!=='/','Root already exists.');const result=await this.#mutate(path,(old,all)=>{if(parent(path)!=='/'){const p=all.find(r=>r.path===parent(path));need(p&&!p.deleted&&p.directory,'Create the parent folder first.');}need(all.length<MAX_ENTRIES,'Browser file limit reached.');if(old)throw new MirrorConflict('An item with that name already exists.');const row={scope:this.#scope,path,directory:true,data:null,sha256:null,base:null,version:crypto.randomUUID(),dirty:true,deleted:false,conflict:false};return [row,{path,version:row.version,status:'pending'}];});this.#hasPending=true;this.#changed();this.#queueSync();return result;}
+  async mkdir(path){
+    path=filePath(path);need(path!=='/','Root already exists.');
+    const accountParents=await this.#accountParents(path);
+    const result=await this.#mutate(path,(old,all)=>{
+      if(parent(path)!=='/'){
+        const p=all.find(row=>row.path===parent(path));
+        need(p&&!p.deleted&&p.directory,'Create the parent folder first.');
+      }
+      need(all.length<MAX_ENTRIES,'Browser file limit reached.');
+      if(old)throw new MirrorConflict('An item with that name already exists.');
+      const row={scope:this.#scope,path,directory:true,data:null,sha256:null,base:null,
+        version:crypto.randomUUID(),dirty:true,deleted:false,conflict:false};
+      return [row,{path,version:row.version,status:'pending'}];
+    },accountParents);
+    this.#hasPending=true;this.#changed();this.#queueSync();
+    return result;
+  }
   // The source version and new destination are checked in the same browser
   // transaction. This is a local snapshot, not a server-side copy operation.
   async copyFile(source,destination,expected){

@@ -226,3 +226,41 @@ test('canceling a pending folder deletion adopts an account file at that path',a
   assert.equal(new TextDecoder().decode((await mirror.read('/Project')).data),'replacement account file');
   assert.equal(mutations(),0);
 });
+
+test('saving to a new account-only folder confirms the parent and preserves the original caller bytes',async t=>{
+  const {entries,mirror,setOffline}=setup(t);
+  await mirror.sync();
+  entries.set('Project',{directory:true});
+  entries.set('Project/Nested',{directory:true});
+  const original=bytes('captured before lookup');
+  const saving=mirror.write('/Project/Nested/draft.txt',original);
+  original.fill(0);
+  const saved=await saving;
+  assert.equal(saved.status,'pending');
+  assert.equal(new TextDecoder().decode((await mirror.read('/Project/Nested/draft.txt')).data),'captured before lookup');
+  assert.equal((await mirror.list('/Project')).entries[0].status,'synced');
+  setOffline(true);
+  assert.equal((await mirror.write('/Project/Nested/offline.txt',bytes('can save offline'))).status,'pending');
+});
+
+test('a nested folder can be created inside a new account folder and absent or deleted parents stay unavailable',async t=>{
+  const {entries,mirror,setOffline}=setup(t);
+  await mirror.sync();
+  entries.set('Project',{directory:true});
+  const created=await mirror.mkdir('/Project/New');
+  assert.equal(created.status,'pending');
+  assert.equal((await mirror.list('/Project')).entries[0].name,'New');
+  await assert.rejects(mirror.write('/Missing/draft.txt',bytes('not written')),/Create the parent folder first/);
+  await assert.rejects(mirror.mkdir('/report.txt/folder'),/Create the parent folder first/);
+
+  entries.set('Deleting',{directory:true});
+  await mirror.mkdir('/Deleting/Temporary');
+  setOffline(true);
+  const [child]=(await mirror.list('/Deleting')).entries;
+  const folder=(await mirror.list('/')).entries.find(item=>item.name==='Deleting');
+  await mirror.remove(child.path,child.version);
+  await mirror.remove(folder.path,folder.version);
+  await waitUntilOffline(mirror);
+  await assert.rejects(mirror.write('/Deleting/draft.txt',bytes('not written')),/Create the parent folder first/);
+  assert.equal((await mirror.list('/')).entries.some(item=>item.name==='Deleting'),false);
+});
