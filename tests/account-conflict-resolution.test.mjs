@@ -78,3 +78,32 @@ test('canceling a conflicted deletion restores the newer account file and honors
   assert.equal(new TextDecoder().decode((await mirror.read('/report.txt')).data),'newer account file');
   assert.equal(mutations(),0);
 });
+
+test('restoring a deleted file retries a rolled-back Blob write as bytes',async t=>{
+  const {entries,mirror,setOffline,mutations}=setup(t);
+  await mirror.sync();
+  const before=await mirror.stat('/report.txt');
+  setOffline(true);
+  await mirror.remove('/report.txt',before.version);
+  await waitUntilOffline(mirror);
+  entries.set('report.txt',entry('verified newer file'));
+  setOffline(false);
+  await mirror.sync();
+  const [conflict]=(await mirror.list('/')).entries;
+  const put=IDBObjectStore.prototype.put;
+  let rejected=0, retried=0;
+  IDBObjectStore.prototype.put=function(value,...args){
+    if(value.path==='/report.txt'&&value.data instanceof Blob){
+      rejected++;
+      throw new DOMException('Error preparing Blob/File data to be stored in object store','UnknownError');
+    }
+    if(value.path==='/report.txt'&&value.data instanceof ArrayBuffer)retried++;
+    return put.call(this,value,...args);
+  };
+  t.after(()=>{IDBObjectStore.prototype.put=put;});
+  await mirror.resolve('/report.txt','server',conflict.version);
+  assert.equal(rejected,1);
+  assert.equal(retried,1);
+  assert.equal(new TextDecoder().decode((await mirror.read('/report.txt')).data),'verified newer file');
+  assert.equal(mutations(),0);
+});

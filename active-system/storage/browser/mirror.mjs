@@ -643,13 +643,13 @@ export class MirroredFiles{
           need(isContentRef(ref)&&ref.size===stored.size&&ref.sha256===remote.sha256,'Remote file failed verification.');
           stored=ref;
         }
-        await this.#update(path,current=>{
+        await this.#storeContent([stored],([data])=>this.#update(path,current=>{
           checkSelection(current);
           if(!entry)return [null,true];
           const directory=entry.directory;
-          return [{scope:this.#scope,path,directory,data:stored,sha256:remote?.sha256??null,
+          return [{scope:this.#scope,path,directory,data,sha256:remote?.sha256??null,
             base:directory?'dir':remote.sha256,version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false},true];
-        });
+        }));
       }
       this.#changed();
       if(choice==='local'||entry?.directory)this.#queueSync();
