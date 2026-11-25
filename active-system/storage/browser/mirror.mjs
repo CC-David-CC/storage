@@ -511,9 +511,17 @@ export class MirroredFiles{
       // classifying pending intent; never reuse the conflicted snapshot here.
       rows=await this.#all();this.#check();
     }
+    // Keep pending changes below a directory conflict on this device.
+    const conflictedDirectories=new Set(rows.filter(row=>row.directory&&row.conflict).map(row=>row.path));
+    const underDirectoryConflict=path=>{
+      for(let ancestor=parent(path);ancestor!=='/';ancestor=parent(ancestor)){
+        if(conflictedDirectories.has(ancestor))return true;
+      }
+      return false;
+    };
     // Create parents before children; remove children before parents.
     const dirty=rows.filter(r=>r.dirty&&!r.conflict&&!r.moving).sort((a,b)=>(a.deleted?1:0)-(b.deleted?1:0)||(a.deleted?b.path.length-a.path.length:a.path.length-b.path.length));
-    for(let index=0;index<dirty.length;index++){let row=dirty[index];this.#check();if(isContentRef(row.data))need(row.sha256===row.data.sha256,'Stored content metadata is inconsistent.');const existing=remote.get(row.path),target=row.path.slice(1);
+    for(let index=0;index<dirty.length;index++){let row=dirty[index];this.#check();if(underDirectoryConflict(row.path))continue;if(isContentRef(row.data))need(row.sha256===row.data.sha256,'Stored content metadata is inconsistent.');const existing=remote.get(row.path),target=row.path.slice(1);
       // Updating existing files needs their server versions. Fetch a bounded
       // group together; the eventual write/delete still enforces its base hash.
       if(canBatch&&!row.directory&&existing&&!existing.directory&&!existing.sha256&&!batchCache.has(target)){
@@ -522,7 +530,10 @@ export class MirroredFiles{
       }
       if(row.directory){
         if(row.deleted){if(existing){if(!existing.directory||[...remote.keys()].some(p=>parent(p)===row.path)){await this.#conflict(row);continue;}await this.#server.remove(target,null,{signal:this.#captureAbort.signal});remote.delete(row.path);}await this.#ack(row,null,{remove:true});}
-        else if(existing&&!existing.directory)await this.#conflict(row);
+        else if(existing&&!existing.directory){
+          conflictedDirectories.add(row.path);
+          await this.#conflict(row);
+        }
         else{if(!existing){await this.#server.mkdir(target,{signal:this.#captureAbort.signal});remote.set(row.path,{directory:true});}await this.#ack(row,'dir');}
       }else{
         if(existing?.directory){await this.#conflict(row);continue;}
@@ -613,6 +624,87 @@ export class MirroredFiles{
     });
     this.#running=task;return task;
   }
+  #conflictTree(rows,path,expected){
+    const root=rows.find(row=>row.path===path);
+    if(!root?.directory||root.deleted||!root.conflict||root.version!==expected)throw new MirrorConflict('This folder conflict changed. Select it again.');
+    const tree=rows.filter(row=>row.path===path||row.path.startsWith(path+'/'));
+    need(tree.length<=MAX_ENTRIES&&!tree.some(row=>row.moving),'Wait for moves in this folder to finish.');
+    const live=new Set(tree.filter(row=>!row.deleted&&row.directory).map(row=>row.path));
+    need(tree.every(row=>row.deleted||row.path===path||live.has(parent(row.path))),'The device folder is incomplete. Check it before copying.');
+    return tree.sort((a,b)=>a.path.length-b.path.length||a.path.localeCompare(b.path)).map(
+      ({path,version,directory,deleted,sha256})=>({path,version,directory,deleted,sha256}));
+  }
+
+  async conflictTree(path,expected){
+    path=filePath(path);
+    need(path!=='/','Choose a folder conflict.');
+    return this.#conflictTree(await this.#all(),path,expected);
+  }
+
+  async #accountRecord(path,entry){
+    if(!entry)return null;
+    const directory=entry.directory;
+    let data=null,sha256=null;
+    if(!directory){
+      const remote=await this.#server.read(path.slice(1),{signal:this.#captureAbort.signal});
+      this.#check();
+      data=new Blob([remote.data]);sha256=remote.sha256;
+      need(data.size<=MAX_FILE&&/^[0-9a-f]{64}$/.test(sha256??''),'Invalid account file.');
+      if(this.#content){
+        const ref=await this.#content.capture(data);
+        this.#check();
+        need(isContentRef(ref)&&ref.size===data.size&&ref.sha256===sha256,'Remote file failed verification.');
+        data=ref;
+      }
+    }
+    return {scope:this.#scope,path,directory,data,sha256,base:directory?'dir':sha256,
+      version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false};
+  }
+
+  async resolveConflictTree(path,destination,expected,selection,internal=null){
+    if(this.#content&&internal!==PUBLICATION_LOCKED){
+      return this.#withPublicationLock(()=>this.resolveConflictTree(path,destination,expected,selection,PUBLICATION_LOCKED));
+    }
+    path=filePath(path);destination=filePath(destination);
+    need(path!=='/'&&destination!==path&&parent(destination)===parent(path),'Choose a separate folder beside the original.');
+    const matches=rows=>{
+      const tree=this.#conflictTree(rows,path,expected);
+      if(JSON.stringify(tree)!==JSON.stringify(selection))throw new MirrorConflict('The device folder changed while copying.');
+      return tree;
+    };
+    const stopValidity=this.#watchValidity();
+    try{
+      const tree=matches(await this.#all());
+      const inventory=await this.#remoteInventory();
+      const canVersion=typeof this.#server.version==='function'&&
+        (typeof this.#server.supportsVersion!=='function'||await this.#server.supportsVersion({signal:this.#captureAbort.signal}));
+      for(const item of tree){
+        if(item.deleted)continue;
+        this.#check();
+        const target=filePath(destination+item.path.slice(path.length));
+        const saved=inventory.get(target);
+        need(saved&&saved.directory===item.directory,'The account folder copy is incomplete.');
+        if(!item.directory){
+          const receipt=saved.sha256?saved:await this.#server[canVersion?'version':'read'](target.slice(1),{signal:this.#captureAbort.signal});
+          need(receipt.sha256===item.sha256,'A file in the account folder copy changed.');
+        }
+      }
+      const replacement=await this.#accountRecord(path,inventory.get(path));
+      await this.#storeContent([replacement?.data],([data])=>this.#tx('readwrite',(store,done,fail)=>{
+        const req=store.index('scope').getAll(this.#scope);
+        req.onsuccess=()=>{try{
+          this.#check();
+          for(const row of matches(req.result))store.delete([this.#scope,row.path]);
+          if(replacement)store.put({...replacement,data});
+          done(true);
+        }catch(error){fail(error);}};
+        req.onerror=()=>fail(req.error);
+      }));
+      this.#changed();
+      this.#queueSync();
+    }finally{stopValidity();}
+  }
+
   async resolve(path,choice,expected,internal=null){
     if(this.#content&&internal!==PUBLICATION_LOCKED)return this.#withPublicationLock(()=>this.resolve(path,choice,expected,PUBLICATION_LOCKED));
     this.#check();
@@ -627,28 +719,19 @@ export class MirroredFiles{
       checkSelection(await this.#get(path));
       const entry=(await this.#remoteInventory()).get(path);
       if(choice==='local')need(!entry?.directory,'The server has a folder at this path.');
-      const remote=entry&&!entry.directory?await this.#server.read(path.slice(1),{signal:this.#captureAbort.signal}):null;
-      this.#check();
       if(choice==='local'){
+        const remote=entry?await this.#server.read(path.slice(1),{signal:this.#captureAbort.signal}):null;
+        this.#check();
         await this.#update(path,current=>{
           checkSelection(current);
           return [{...current,base:remote?.sha256??null,attempted:null,conflict:false,dirty:true},true];
         });
         this.#hasPending=true;
       }else{
-        let stored=remote?new Blob([remote.data]):null;
-        if(remote&&this.#content){
-          const ref=await this.#content.capture(stored);
-          this.#check();
-          need(isContentRef(ref)&&ref.size===stored.size&&ref.sha256===remote.sha256,'Remote file failed verification.');
-          stored=ref;
-        }
-        await this.#storeContent([stored],([data])=>this.#update(path,current=>{
+        const record=await this.#accountRecord(path,entry);
+        await this.#storeContent([record?.data],([data])=>this.#update(path,current=>{
           checkSelection(current);
-          if(!entry)return [null,true];
-          const directory=entry.directory;
-          return [{scope:this.#scope,path,directory,data,sha256:remote?.sha256??null,
-            base:directory?'dir':remote.sha256,version:crypto.randomUUID(),dirty:false,deleted:false,conflict:false},true];
+          return [record?{...record,data}:null,true];
         }));
       }
       this.#changed();

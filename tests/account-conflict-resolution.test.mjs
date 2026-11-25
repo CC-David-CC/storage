@@ -24,7 +24,18 @@ function setup(t) {
       if (!row || row.directory) throw Object.assign(Error('File not found.'),{status:404});
       return row;
     },
-    async write() {check(); mutations++; throw Error('Unexpected write');},
+    async mkdir(path) {
+      check();
+      const parent=path.slice(0,path.lastIndexOf('/'));
+      if(parent&&!entries.get(parent)?.directory)throw Object.assign(Error('Parent folder unavailable.'),{status:409});
+      mutations++; throw Error('Unexpected folder creation');
+    },
+    async write(path) {
+      check();
+      const parent=path.slice(0,path.lastIndexOf('/'));
+      if(parent&&!entries.get(parent)?.directory)throw Object.assign(Error('Parent folder unavailable.'),{status:409});
+      mutations++; throw Error('Unexpected write');
+    },
     async remove() {check(); mutations++; throw Error('Unexpected deletion');}
   };
   const mirror = new MirroredFiles({scope:crypto.randomUUID(),server,retryMs:0});
@@ -105,5 +116,41 @@ test('restoring a deleted file retries a rolled-back Blob write as bytes',async 
   assert.equal(rejected,1);
   assert.equal(retried,1);
   assert.equal(new TextDecoder().decode((await mirror.read('/report.txt')).data),'verified newer file');
+  assert.equal(mutations(),0);
+});
+
+test('confirming a folder copy preserves local children until the exact account tree is verified',async t=>{
+  const {entries,mirror,setOffline,mutations}=setup(t);
+  await mirror.sync();
+  setOffline(true);
+  await mirror.mkdir('/Project');
+  await mirror.mkdir('/Project/Empty');
+  await mirror.write('/Project/note.txt',bytes('device note'));
+  await waitUntilOffline(mirror);
+  entries.set('Project',entry('account file at the original path'));
+  setOffline(false);
+  // Local writes may have queued a final failed scan before reconnect.
+  try{await mirror.sync();}catch(error){if(error.message!=='Offline')throw error;}
+  await mirror.sync();
+  const root=(await mirror.list('/')).entries.find(item=>item.name==='Project');
+  assert.equal(root.status,'conflict');
+  const tree=await mirror.conflictTree('/Project',root.version);
+  assert.deepEqual(tree.map(item=>item.path),['/Project','/Project/Empty','/Project/note.txt']);
+  entries.set('Project-copy',{directory:true});
+  entries.set('Project-copy/Empty',{directory:true});
+  entries.set('Project-copy/note.txt',entry('wrong bytes'));
+  await assert.rejects(mirror.resolveConflictTree('/Project','/Project-copy',root.version,tree),/folder copy changed/);
+  assert.equal(new TextDecoder().decode((await mirror.read('/Project/note.txt')).data),'device note');
+
+  entries.set('Project-copy/note.txt',entry('device note'));
+  await mirror.write('/Project/late.txt',bytes('saved after selection'));
+  await assert.rejects(mirror.resolveConflictTree('/Project','/Project-copy',root.version,tree),/device folder changed/i);
+  const updated=await mirror.conflictTree('/Project',root.version);
+  entries.set('Project-copy/late.txt',entry('saved after selection'));
+  await mirror.resolveConflictTree('/Project','/Project-copy',root.version,updated);
+  await mirror.sync();
+  assert.equal(new TextDecoder().decode((await mirror.read('/Project')).data),'account file at the original path');
+  assert.equal(new TextDecoder().decode((await mirror.read('/Project-copy/note.txt')).data),'device note');
+  assert.equal((await mirror.list('/Project-copy/Empty')).entries.length,0);
   assert.equal(mutations(),0);
 });
